@@ -1,8 +1,9 @@
 import Stripe from 'stripe';
 
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-
-export const stripe = new Stripe(stripeSecretKey);
+export function getStripe() {
+  const secretKey = process.env.STRIPE_SECRET_KEY || 'sk_test_dummy_key_for_dev';
+  return new Stripe(secretKey);
+}
 
 /**
  * Creates a Stripe PaymentIntent for the given order amount
@@ -11,6 +12,7 @@ export const stripe = new Stripe(stripeSecretKey);
  */
 export async function createStripePaymentIntent(amountInBdt, customerEmail) {
   try {
+    const stripe = getStripe();
     // Convert BDT to USD cents for Stripe Card processing (1 USD ~ 115 BDT)
     const amountInUsdCents = Math.max(100, Math.round((amountInBdt / 115) * 100));
 

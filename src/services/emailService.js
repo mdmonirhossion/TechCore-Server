@@ -2,8 +2,8 @@ import nodemailer from 'nodemailer';
 import { BirdClient } from '@messagebird/sdk';
 
 // Initialize MessageBird / Bird Client
-const birdApiKey = process.env.BIRD_API_KEY;
-export const bird = new BirdClient({ apiKey: birdApiKey || '' });
+const birdApiKey = process.env.BIRD_API_KEY || 'bk_us1_dummy_key_for_dev';
+export const bird = new BirdClient({ apiKey: birdApiKey });
 
 // Create Nodemailer transporter with Gmail App Password credentials
 export const transporter = nodemailer.createTransport({

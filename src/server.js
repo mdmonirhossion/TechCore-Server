@@ -1,12 +1,16 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 dotenv.config();
 
 import { connectDB } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
 import { ProductModel } from './models/Product.js';
 import { OrderModel } from './models/Order.js';
+import { UserModel } from './models/User.js';
+import { verifyToken, requireApprovedAdmin, requireSuperAdmin } from './middleware/auth.js';
 
 import { categories, brands, products as initialProducts, sampleServiceRequests, sampleSuppliers } from './data/seedData.js';
 import { evaluatePcBuild } from './services/compatibilityEngine.js';
@@ -51,9 +55,34 @@ app.post('/api/create-payment-intent', async (req, res) => {
 // Connect to MongoDB Atlas
 let isMongoConnected = false;
 
+const seedSuperAdmin = async () => {
+  try {
+    const mainEmail = 'techcoreadmin@gmail.com';
+    const existingAdmin = await UserModel.findOne({ email: mainEmail });
+    if (!existingAdmin) {
+      console.log('👑 Seeding Main Super Admin account (techcoreadmin@gmail.com)...');
+      const hashedPassword = await bcrypt.hash('admin890@', 10);
+      await UserModel.create({
+        name: 'TechCore Main Admin',
+        email: mainEmail,
+        password: hashedPassword,
+        role: 'SUPER_ADMIN',
+        status: 'APPROVED',
+        phone: '+8801700000000'
+      });
+      console.log('✅ Main Super Admin account created successfully! (techcoreadmin@gmail.com)');
+    } else {
+      console.log('✅ Main Super Admin account active (techcoreadmin@gmail.com).');
+    }
+  } catch (err) {
+    console.error('❌ Super Admin Seeding Error:', err.message);
+  }
+};
+
 connectDB().then(async (connected) => {
   isMongoConnected = connected;
   if (connected) {
+    await seedSuperAdmin();
     // Seed initial products to MongoDB Atlas if database is empty
     try {
       const count = await ProductModel.countDocuments();
@@ -129,6 +158,180 @@ app.post('/api/upload', async (req, res) => {
   } catch (err) {
     console.error('Cloudinary Upload Error:', err);
     res.status(500).json({ message: 'Cloudinary upload failed', error: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+// AUTHENTICATION & ROLE-BASED ACCESS APIS
+// -------------------------------------------------------------
+
+// Register User or Request Co-Admin status
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { name, email, password, role, phone } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required.' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    if (normalizedEmail === 'techcoreadmin@gmail.com') {
+      return res.status(400).json({ message: 'This email is reserved for the Main Super Admin.' });
+    }
+
+    const existing = await UserModel.findOne({ email: normalizedEmail });
+    if (existing) {
+      return res.status(400).json({ message: 'An account with this email already exists.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const requestedRole = role === 'CO_ADMIN' ? 'CO_ADMIN' : 'USER';
+    const initialStatus = requestedRole === 'CO_ADMIN' ? 'PENDING' : 'APPROVED';
+
+    const newUser = await UserModel.create({
+      name,
+      email: normalizedEmail,
+      password: hashedPassword,
+      role: requestedRole,
+      status: initialStatus,
+      phone
+    });
+
+    const jwtSecret = process.env.JWT_SECRET || 'techcore_super_secret_jwt_key_2026';
+    const token = jwt.sign({ id: newUser._id, role: newUser.role }, jwtSecret, { expiresIn: '7d' });
+
+    res.status(201).json({
+      message: requestedRole === 'CO_ADMIN'
+        ? 'Co-Admin registration submitted! Awaiting Main Admin approval.'
+        : 'Registration successful!',
+      token,
+      user: {
+        id: newUser._id,
+        name: newUser.name,
+        email: newUser.email,
+        role: newUser.role,
+        status: newUser.status,
+        phone: newUser.phone
+      }
+    });
+  } catch (err) {
+    console.error('Registration Error:', err);
+    res.status(500).json({ message: 'Registration failed', error: err.message });
+  }
+});
+
+// Login API
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ message: 'Email and password are required.' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await UserModel.findOne({ email: normalizedEmail });
+
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid email or password.' });
+    }
+
+    const jwtSecret = process.env.JWT_SECRET || 'techcore_super_secret_jwt_key_2026';
+    const token = jwt.sign({ id: user._id, role: user.role }, jwtSecret, { expiresIn: '7d' });
+
+    res.json({
+      message: 'Login successful!',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        phone: user.phone
+      }
+    });
+  } catch (err) {
+    console.error('Login Error:', err);
+    res.status(500).json({ message: 'Login failed', error: err.message });
+  }
+});
+
+// Get Current User Profile
+app.get('/api/auth/me', verifyToken, async (req, res) => {
+  res.json({ user: req.user });
+});
+
+// -------------------------------------------------------------
+// SUPER ADMIN APPROVAL & CO-ADMIN MANAGEMENT APIS
+// -------------------------------------------------------------
+
+// Get pending Co-Admin requests (Super Admin Only)
+app.get('/api/admin/pending-admins', requireSuperAdmin, async (req, res) => {
+  try {
+    const pendingAdmins = await UserModel.find({ role: 'CO_ADMIN', status: 'PENDING' })
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json(pendingAdmins);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch pending admins', error: err.message });
+  }
+});
+
+// Get all admins & co-admins (Super Admin Only)
+app.get('/api/admin/all-admins', requireSuperAdmin, async (req, res) => {
+  try {
+    const admins = await UserModel.find({ role: { $in: ['CO_ADMIN', 'SUPER_ADMIN'] } })
+      .select('-password')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json(admins);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch admins', error: err.message });
+  }
+});
+
+// Approve Co-Admin (Super Admin Only)
+app.patch('/api/admin/approve-admin/:id', requireSuperAdmin, async (req, res) => {
+  try {
+    const user = await UserModel.findByIdAndUpdate(
+      req.params.id,
+      { status: 'APPROVED' },
+      { new: true }
+    ).select('-password');
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    res.json({
+      message: `Co-Admin ${user.name} has been approved! They can now add/edit/delete products.`,
+      user
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Approval failed', error: err.message });
+  }
+});
+
+// Reject Co-Admin (Super Admin Only)
+app.patch('/api/admin/reject-admin/:id', requireSuperAdmin, async (req, res) => {
+  try {
+    const user = await UserModel.findByIdAndUpdate(
+      req.params.id,
+      { status: 'REJECTED' },
+      { new: true }
+    ).select('-password');
+
+    if (!user) return res.status(404).json({ message: 'User not found.' });
+
+    res.json({
+      message: `Co-Admin request for ${user.name} has been rejected.`,
+      user
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Rejection failed', error: err.message });
   }
 });
 
@@ -221,11 +424,85 @@ app.get('/api/products/search', (req, res) => {
   });
 });
 
-// Compare up to 4 products
-app.get('/api/products/compare', (req, res) => {
+// Compare up to 4 products (Public Access - Star Tech Style High Performance)
+app.get('/api/products/compare', async (req, res) => {
   const ids = (req.query.ids || '').split(',').filter(Boolean);
+  if (ids.length === 0) return res.json({ products: [] });
+
+  if (isMongoConnected) {
+    try {
+      const dbMatched = await ProductModel.find({ id: { $in: ids } }).lean();
+      if (dbMatched && dbMatched.length > 0) {
+        return res.json({ products: dbMatched });
+      }
+    } catch (e) {
+      console.error('Mongo compare error:', e.message);
+    }
+  }
+
   const matched = productsStore.filter(p => ids.includes(p.id));
   res.json({ products: matched });
+});
+
+// Product Creation (Protected: Super Admin OR Approved Co-Admin Only)
+app.post('/api/products', requireApprovedAdmin, async (req, res) => {
+  try {
+    const newProd = req.body;
+    if (!newProd.id || !newProd.name || !newProd.price) {
+      return res.status(400).json({ message: 'Missing required product fields (id, name, price).' });
+    }
+
+    if (isMongoConnected) {
+      const created = await ProductModel.create(newProd);
+      productsStore.unshift(created.toObject());
+      return res.status(201).json(created);
+    }
+
+    productsStore.unshift(newProd);
+    res.status(201).json(newProd);
+  } catch (err) {
+    console.error('Product Creation Error:', err.message);
+    res.status(500).json({ message: 'Failed to create product', error: err.message });
+  }
+});
+
+// Product Update (Protected: Super Admin OR Approved Co-Admin Only)
+app.put('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    if (isMongoConnected) {
+      const updated = await ProductModel.findOneAndUpdate(
+        { id: req.params.id },
+        req.body,
+        { new: true }
+      ).lean();
+      if (updated) return res.json(updated);
+    }
+
+    const idx = productsStore.findIndex(p => p.id === req.params.id);
+    if (idx !== -1) {
+      productsStore[idx] = { ...productsStore[idx], ...req.body };
+      return res.json(productsStore[idx]);
+    }
+
+    res.status(404).json({ message: 'Product not found' });
+  } catch (err) {
+    console.error('Product Update Error:', err.message);
+    res.status(500).json({ message: 'Failed to update product', error: err.message });
+  }
+});
+
+// Product Deletion (Protected: Super Admin OR Approved Co-Admin Only)
+app.delete('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    if (isMongoConnected) {
+      await ProductModel.deleteOne({ id: req.params.id });
+    }
+    productsStore = productsStore.filter(p => p.id !== req.params.id);
+    res.json({ message: 'Product deleted successfully' });
+  } catch (err) {
+    console.error('Product Deletion Error:', err.message);
+    res.status(500).json({ message: 'Failed to delete product', error: err.message });
+  }
 });
 
 app.get('/api/products/:id', async (req, res) => {

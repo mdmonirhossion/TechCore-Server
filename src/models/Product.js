@@ -22,4 +22,11 @@ const productSchema = new mongoose.Schema({
   tags: [{ type: String }]
 }, { timestamps: true });
 
+// High-concurrency database indexing for Star-Tech style fast search & filter
+productSchema.index({ categorySlug: 1 });
+productSchema.index({ brand: 1 });
+productSchema.index({ price: 1 });
+productSchema.index({ builderCategory: 1 });
+productSchema.index({ name: 'text', brand: 'text', category: 'text', tags: 'text' });
+
 export const ProductModel = mongoose.models.Product || mongoose.model('Product', productSchema);
