@@ -1,9 +1,8 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-dotenv.config();
 
 import { connectDB } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
@@ -26,6 +25,7 @@ app.use(express.json({ limit: '10mb' }));
 
 // Chrome DevTools background request handling to silence 404/CSP logs
 app.get('/.well-known/appspecific/com.chrome.devtools.json', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.status(204).end();
 });
 
@@ -72,7 +72,12 @@ const seedSuperAdmin = async () => {
       });
       console.log('✅ Main Super Admin account created successfully! (techcoreadmin@gmail.com)');
     } else {
-      console.log('✅ Main Super Admin account active (techcoreadmin@gmail.com).');
+      const hashedPassword = await bcrypt.hash('admin890@', 10);
+      existingAdmin.role = 'SUPER_ADMIN';
+      existingAdmin.status = 'APPROVED';
+      existingAdmin.password = hashedPassword;
+      await existingAdmin.save();
+      console.log('✅ Main Super Admin account updated to SUPER_ADMIN & active (techcoreadmin@gmail.com).');
     }
   } catch (err) {
     console.error('❌ Super Admin Seeding Error:', err.message);

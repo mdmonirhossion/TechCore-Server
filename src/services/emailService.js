@@ -5,14 +5,16 @@ import { BirdClient } from '@messagebird/sdk';
 const birdApiKey = process.env.BIRD_API_KEY || 'bk_us1_dummy_key_for_dev';
 export const bird = new BirdClient({ apiKey: birdApiKey });
 
-// Create Nodemailer transporter with Gmail App Password credentials
-export const transporter = nodemailer.createTransport({
-  service: process.env.EMAIL_SERVICE || 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
-});
+// Create dynamic Nodemailer transporter with Gmail App Password credentials
+export function getTransporter() {
+  return nodemailer.createTransport({
+    service: process.env.EMAIL_SERVICE || 'gmail',
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
+    }
+  });
+}
 
 /**
  * Sends order confirmation HTML email to customer with attached PDF invoice
@@ -117,7 +119,7 @@ export async function sendOrderConfirmationEmail({ order, pdfBuffer }) {
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await getTransporter().sendMail(mailOptions);
     console.log(`📧 Nodemailer Gmail confirmation email sent to ${customerEmail} (MessageId: ${info.messageId})`);
     return info;
   } catch (err) {
@@ -151,7 +153,7 @@ export async function sendAdminOrderNotificationEmail({ order }) {
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const info = await getTransporter().sendMail(mailOptions);
     console.log(`🔔 Admin notification email sent to ${adminEmail}`);
     return info;
   } catch (err) {
