@@ -401,32 +401,59 @@ app.get('/api/products', async (req, res) => {
 });
 
 // Search suggestions & auto-complete multi-field engine
-app.get('/api/products/search', (req, res) => {
-  const q = (req.query.q || '').toLowerCase().trim();
-  if (!q) {
-    return res.json({ products: [], brands: [], categories: [], suggestions: [] });
+app.get('/api/products/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toLowerCase().trim();
+    if (!q) {
+      return res.json({ products: [], brands: [], categories: [], suggestions: [] });
+    }
+
+    let matchingProducts = [];
+    if (isMongoConnected) {
+      try {
+        const regex = new RegExp(q, 'i');
+        matchingProducts = await ProductModel.find({
+          $or: [
+            { name: regex },
+            { sku: regex },
+            { tags: { $in: [regex] } },
+            { brand: regex },
+            { category: regex }
+          ]
+        }).limit(6).lean();
+      } catch (e) {
+        console.error('Mongo search query error, fallback to memory:', e.message);
+      }
+    }
+
+    if (!matchingProducts || matchingProducts.length === 0) {
+      matchingProducts = productsStore.filter(p =>
+        (p.name && p.name.toLowerCase().includes(q)) ||
+        (p.sku && p.sku.toLowerCase().includes(q)) ||
+        (p.tags && p.tags.some(t => t && t.toLowerCase().includes(q)))
+      ).slice(0, 6);
+    }
+
+    const matchingBrands = brands.filter(b => b && b.toLowerCase().includes(q));
+    const matchingCategories = categories.filter(c => c && (c.name.toLowerCase().includes(q) || c.slug.includes(q)));
+
+    const suggestions = Array.from(new Set([
+      `${q}`,
+      `${q} Gaming PC`,
+      `${q} Laptop`,
+      `${q} Price in Bangladesh`
+    ])).slice(0, 4);
+
+    res.json({
+      products: matchingProducts,
+      brands: matchingBrands,
+      categories: matchingCategories,
+      suggestions
+    });
+  } catch (err) {
+    console.error('Search API error:', err.message);
+    res.status(500).json({ message: 'Search failed', error: err.message });
   }
-
-  const matchingProducts = productsStore.filter(p =>
-    p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || (p.tags && p.tags.some(t => t.toLowerCase().includes(q)))
-  ).slice(0, 6);
-
-  const matchingBrands = brands.filter(b => b.toLowerCase().includes(q));
-  const matchingCategories = categories.filter(c => c.name.toLowerCase().includes(q) || c.slug.includes(q));
-
-  const suggestions = Array.from(new Set([
-    `${q}`,
-    `${q} Gaming PC`,
-    `${q} Laptop`,
-    `${q} Price in Bangladesh`
-  ])).slice(0, 4);
-
-  res.json({
-    products: matchingProducts,
-    brands: matchingBrands,
-    categories: matchingCategories,
-    suggestions
-  });
 });
 
 // Compare up to 4 products (Public Access - Star Tech Style High Performance)
@@ -535,130 +562,183 @@ app.get('/api/brands', (req, res) => {
 // 2. PC BUILDER & INTERACTIVE TOOLS APIS
 // -------------------------------------------------------------
 app.post('/api/builder/check', (req, res) => {
-  const { selectedComponents } = req.body;
-  const evaluation = evaluatePcBuild(selectedComponents || {});
-  res.json(evaluation);
+  try {
+    const { selectedComponents } = req.body;
+    const evaluation = evaluatePcBuild(selectedComponents || {});
+    res.json(evaluation);
+  } catch (err) {
+    console.error('Builder Check Error:', err.message);
+    res.status(500).json({ message: 'PC build evaluation failed', error: err.message });
+  }
 });
 
-app.post('/api/laptop-finder/recommend', (req, res) => {
-  const { maxBudget, usageScenario } = req.body;
-  const laptops = productsStore.filter(p => p.categorySlug === 'laptop');
+app.post('/api/laptop-finder/recommend', async (req, res) => {
+  try {
+    const { maxBudget, usageScenario } = req.body;
+    let laptops = productsStore.filter(p => p.categorySlug === 'laptop');
 
-  const scoredLaptops = laptops.map(laptop => {
-    let score = 100;
-    const price = laptop.discountPrice;
-
-    if (maxBudget && price > maxBudget) {
-      score -= Math.min(60, Math.floor((price - maxBudget) / 2000) * 5);
-    }
-
-    if (usageScenario) {
-      const target = (laptop.specifications?.targetAudience || '').toLowerCase();
-      if (target.includes(usageScenario.toLowerCase())) {
-        score += 20;
+    if (isMongoConnected) {
+      try {
+        const dbLaptops = await ProductModel.find({ categorySlug: 'laptop' }).lean();
+        if (dbLaptops && dbLaptops.length > 0) {
+          laptops = dbLaptops;
+        }
+      } catch (e) {
+        console.error('Mongo laptop fetch error, fallback to memory:', e.message);
       }
     }
 
-    return {
-      laptop,
-      matchPercentage: Math.max(40, Math.min(99, score))
-    };
-  });
+    const scoredLaptops = laptops.map(laptop => {
+      let score = 100;
+      const price = laptop.discountPrice;
 
-  scoredLaptops.sort((a, b) => b.matchPercentage - a.matchPercentage);
-  res.json(scoredLaptops);
+      if (maxBudget && price > maxBudget) {
+        score -= Math.min(60, Math.floor((price - maxBudget) / 2000) * 5);
+      }
+
+      if (usageScenario) {
+        const target = (laptop.specifications?.targetAudience || '').toLowerCase();
+        if (target.includes(usageScenario.toLowerCase())) {
+          score += 20;
+        }
+      }
+
+      return {
+        laptop,
+        matchPercentage: Math.max(40, Math.min(99, score))
+      };
+    });
+
+    scoredLaptops.sort((a, b) => b.matchPercentage - a.matchPercentage);
+    res.json(scoredLaptops);
+  } catch (err) {
+    console.error('Laptop Finder Error:', err.message);
+    res.status(500).json({ message: 'Laptop recommendation failed', error: err.message });
+  }
 });
 
 // AI PC Recommendation Prompt Simulation Engine
-app.post('/api/ai/recommend-pc', (req, res) => {
-  const { budget, useCase } = req.body;
-  const numericBudget = Number(budget) || 80000;
+app.post('/api/ai/recommend-pc', async (req, res) => {
+  try {
+    const { budget, useCase } = req.body;
+    const numericBudget = Number(budget) || 80000;
 
-  const cpus = productsStore.filter(p => p.builderCategory === 'CPU');
-  const gpus = productsStore.filter(p => p.builderCategory === 'GPU');
-  const mbs = productsStore.filter(p => p.builderCategory === 'Motherboard');
-  const rams = productsStore.filter(p => p.builderCategory === 'RAM');
-  const psus = productsStore.filter(p => p.builderCategory === 'PSU');
+    let allProds = [...productsStore];
+    if (isMongoConnected) {
+      try {
+        const dbProds = await ProductModel.find().lean();
+        if (dbProds && dbProds.length > 0) {
+          allProds = dbProds;
+        }
+      } catch (e) {
+        console.error('Mongo AI PC fetch error, fallback to memory:', e.message);
+      }
+    }
 
-  const selectedCpu = cpus.find(c => c.discountPrice <= numericBudget * 0.3) || cpus[0];
-  const selectedMb = mbs.find(m => m.specifications?.socket === selectedCpu?.specifications?.socket) || mbs[0];
-  const selectedRam = rams.find(r => r.specifications?.ramType === selectedMb?.specifications?.ramType) || rams[0];
-  const selectedGpu = gpus.find(g => g.discountPrice <= numericBudget * 0.45) || gpus[0];
-  const selectedPsu = psus[0];
+    const cpus = allProds.filter(p => p.builderCategory === 'CPU');
+    const gpus = allProds.filter(p => p.builderCategory === 'GPU');
+    const mbs = allProds.filter(p => p.builderCategory === 'Motherboard');
+    const rams = allProds.filter(p => p.builderCategory === 'RAM');
+    const psus = allProds.filter(p => p.builderCategory === 'PSU');
 
-  const estimatedTotal = (selectedCpu?.discountPrice || 0) +
-                         (selectedMb?.discountPrice || 0) +
-                         (selectedRam?.discountPrice || 0) +
-                         (selectedGpu?.discountPrice || 0) +
-                         (selectedPsu?.discountPrice || 0);
+    const selectedCpu = cpus.find(c => c.discountPrice <= numericBudget * 0.3) || cpus[0];
+    const selectedMb = mbs.find(m => m.specifications?.socket === selectedCpu?.specifications?.socket) || mbs[0];
+    const selectedRam = rams.find(r => r.specifications?.ramType === selectedMb?.specifications?.ramType) || rams[0];
+    const selectedGpu = gpus.find(g => g.discountPrice <= numericBudget * 0.45) || gpus[0];
+    const selectedPsu = psus[0];
 
-  res.json({
-    recommendationSummary: `Optimized custom rig tailored for ${useCase || 'Gaming & Content Creation'} within ৳${numericBudget.toLocaleString()} BDT.`,
-    build: {
-      cpu: selectedCpu,
-      motherboard: selectedMb,
-      ram: selectedRam,
-      gpu: selectedGpu,
-      psu: selectedPsu
-    },
-    estimatedTotal
-  });
+    const estimatedTotal = (selectedCpu?.discountPrice || 0) +
+                           (selectedMb?.discountPrice || 0) +
+                           (selectedRam?.discountPrice || 0) +
+                           (selectedGpu?.discountPrice || 0) +
+                           (selectedPsu?.discountPrice || 0);
+
+    res.json({
+      recommendationSummary: `Optimized custom rig tailored for ${useCase || 'Gaming & Content Creation'} within ৳${numericBudget.toLocaleString()} BDT.`,
+      build: {
+        cpu: selectedCpu,
+        motherboard: selectedMb,
+        ram: selectedRam,
+        gpu: selectedGpu,
+        psu: selectedPsu
+      },
+      estimatedTotal
+    });
+  } catch (err) {
+    console.error('AI PC Recommendation Error:', err.message);
+    res.status(500).json({ message: 'PC recommendation failed', error: err.message });
+  }
 });
 
 // -------------------------------------------------------------
 // 3. CART & ORDER APIS
 // -------------------------------------------------------------
 app.post('/api/orders', async (req, res) => {
-  const { customer, items, subtotal, discount, deliveryFee, paymentMethod } = req.body;
+  try {
+    const { customer, items, subtotal, discount, deliveryFee, paymentMethod } = req.body;
 
-  const newOrder = {
-    id: `INV-${Math.floor(10000 + Math.random() * 90000)}`,
-    customer,
-    items,
-    subtotal,
-    discount,
-    deliveryFee,
-    grandTotal: subtotal - discount + deliveryFee,
-    paymentMethod: paymentMethod || 'Cash on Delivery',
-    paymentStatus: paymentMethod === 'bKash' || paymentMethod === 'Nagad' ? 'Paid' : 'Pending',
-    orderStatus: 'Confirmed',
-    trackingHistory: [
-      { status: 'Pending', time: new Date().toLocaleString() },
-      { status: 'Confirmed', time: new Date().toLocaleString() }
-    ],
-    createdAt: new Date().toISOString().split('T')[0]
-  };
+    const newOrder = {
+      id: `INV-${Math.floor(10000 + Math.random() * 90000)}`,
+      customer,
+      items,
+      subtotal,
+      discount,
+      deliveryFee,
+      grandTotal: subtotal - discount + deliveryFee,
+      paymentMethod: paymentMethod || 'Cash on Delivery',
+      paymentStatus: paymentMethod === 'bKash' || paymentMethod === 'Nagad' ? 'Paid' : 'Pending',
+      orderStatus: 'Confirmed',
+      trackingHistory: [
+        { status: 'Pending', time: new Date().toLocaleString() },
+        { status: 'Confirmed', time: new Date().toLocaleString() }
+      ],
+      createdAt: new Date().toISOString().split('T')[0]
+    };
 
-  if (isMongoConnected) {
-    try {
-      await OrderModel.create(newOrder);
-    } catch (e) {
-      console.error('Mongo Order save error:', e.message);
+    if (isMongoConnected) {
+      try {
+        await OrderModel.create(newOrder);
+      } catch (e) {
+        console.error('Mongo Order save error:', e.message);
+      }
     }
+
+    // Reduce product inventory stock in memory & MongoDB
+    for (const item of (items || [])) {
+      const p = productsStore.find(prod => prod.id === item.productId);
+      if (p && p.stock >= item.quantity) {
+        p.stock -= item.quantity;
+      }
+      if (isMongoConnected && item.productId && item.quantity > 0) {
+        try {
+          await ProductModel.findOneAndUpdate(
+            { id: item.productId },
+            { $inc: { stock: -item.quantity } }
+          );
+        } catch (e) {
+          console.error(`Failed to decrement MongoDB stock for product ${item.productId}:`, e.message);
+        }
+      }
+    }
+
+    ordersStore.unshift(newOrder);
+
+    // Asynchronously generate PDF invoice & dispatch confirmation email + admin notification
+    (async () => {
+      try {
+        const pdfBuffer = await generateInvoicePdfBuffer(newOrder);
+        await sendOrderConfirmationEmail({ order: newOrder, pdfBuffer });
+        await sendAdminOrderNotificationEmail({ order: newOrder });
+      } catch (err) {
+        console.error('❌ Asynchronous Order Email/PDF dispatch error:', err.message);
+      }
+    })();
+
+    res.status(201).json(newOrder);
+  } catch (err) {
+    console.error('Order creation error:', err.message);
+    res.status(500).json({ message: 'Order creation failed', error: err.message });
   }
-
-  // Reduce product inventory stock
-  items.forEach(item => {
-    const p = productsStore.find(prod => prod.id === item.productId);
-    if (p && p.stock >= item.quantity) {
-      p.stock -= item.quantity;
-    }
-  });
-
-  ordersStore.unshift(newOrder);
-
-  // Asynchronously generate PDF invoice & dispatch confirmation email + admin notification
-  (async () => {
-    try {
-      const pdfBuffer = await generateInvoicePdfBuffer(newOrder);
-      await sendOrderConfirmationEmail({ order: newOrder, pdfBuffer });
-      await sendAdminOrderNotificationEmail({ order: newOrder });
-    } catch (err) {
-      console.error('❌ Asynchronous Order Email/PDF dispatch error:', err.message);
-    }
-  })();
-
-  res.status(201).json(newOrder);
 });
 
 app.get('/api/orders/:id', async (req, res) => {
@@ -716,63 +796,131 @@ app.post('/api/service', (req, res) => {
 // -------------------------------------------------------------
 // 5. ADMIN & ERP DASHBOARD APIS
 // -------------------------------------------------------------
-app.get('/api/admin/analytics', (req, res) => {
-  const totalSales = ordersStore.reduce((sum, o) => sum + o.grandTotal, 0) + 1450000;
-  const totalOrders = ordersStore.length + 128;
-  const lowStockProducts = productsStore.filter(p => p.stock <= 10);
+app.get('/api/admin/analytics', async (req, res) => {
+  try {
+    let allOrders = [...ordersStore];
+    let allProducts = [...productsStore];
 
-  res.json({
-    kpis: {
-      totalSales,
-      totalOrders,
-      totalCustomers: 492,
-      lowStockCount: lowStockProducts.length,
-      revenue: totalSales,
-      purchaseCost: Math.round(totalSales * 0.75),
-      grossProfit: Math.round(totalSales * 0.25)
-    },
-    salesTrend: [
-      { month: 'Jan', sales: 240000, profit: 55000 },
-      { month: 'Feb', sales: 310000, profit: 72000 },
-      { month: 'Mar', sales: 290000, profit: 68000 },
-      { month: 'Apr', sales: 420000, profit: 98000 },
-      { month: 'May', sales: 380000, profit: 89000 },
-      { month: 'Jun', sales: 510000, profit: 122000 }
-    ],
-    categoryShare: [
-      { name: 'Graphics Cards', value: 42 },
-      { name: 'Processors', value: 28 },
-      { name: 'Laptops', value: 18 },
-      { name: 'Motherboards', value: 12 }
-    ]
-  });
-});
+    if (isMongoConnected) {
+      try {
+        const dbOrders = await OrderModel.find().lean();
+        if (dbOrders && dbOrders.length > 0) {
+          allOrders = dbOrders;
+        }
+        const dbProducts = await ProductModel.find().lean();
+        if (dbProducts && dbProducts.length > 0) {
+          allProducts = dbProducts;
+        }
+      } catch (e) {
+        console.error('Mongo analytics fetch error, fallback to memory:', e.message);
+      }
+    }
 
-app.get('/api/admin/inventory', (req, res) => {
-  const inventory = productsStore.map(p => ({
-    id: p.id,
-    sku: p.sku,
-    name: p.name,
-    brand: p.brand,
-    category: p.category,
-    currentStock: p.stock,
-    soldCount: Math.floor(Math.random() * 40) + 10,
-    reservedCount: Math.floor(Math.random() * 5),
-    damagedCount: 1,
-    status: p.stock <= 8 ? 'LOW_STOCK' : 'IN_STOCK'
-  }));
+    const totalSales = allOrders.reduce((sum, o) => sum + (o.grandTotal || 0), 0) + 1450000;
+    const totalOrders = allOrders.length + 128;
+    const lowStockProducts = allProducts.filter(p => p.stock <= 10);
 
-  res.json(inventory);
-});
-
-app.patch('/api/admin/inventory/:id', (req, res) => {
-  const { newStock } = req.body;
-  const prod = productsStore.find(p => p.id === req.params.id);
-  if (prod) {
-    prod.stock = Number(newStock);
-    return res.json({ message: 'Stock updated', product: prod });
+    res.json({
+      kpis: {
+        totalSales,
+        totalOrders,
+        totalCustomers: 492,
+        lowStockCount: lowStockProducts.length,
+        revenue: totalSales,
+        purchaseCost: Math.round(totalSales * 0.75),
+        grossProfit: Math.round(totalSales * 0.25)
+      },
+      salesTrend: [
+        { month: 'Jan', sales: 240000, profit: 55000 },
+        { month: 'Feb', sales: 310000, profit: 72000 },
+        { month: 'Mar', sales: 290000, profit: 68000 },
+        { month: 'Apr', sales: 420000, profit: 98000 },
+        { month: 'May', sales: 380000, profit: 89000 },
+        { month: 'Jun', sales: 510000, profit: 122000 }
+      ],
+      categoryShare: [
+        { name: 'Graphics Cards', value: 42 },
+        { name: 'Processors', value: 28 },
+        { name: 'Laptops', value: 18 },
+        { name: 'Motherboards', value: 12 }
+      ]
+    });
+  } catch (err) {
+    console.error('Analytics Error:', err.message);
+    res.status(500).json({ message: 'Failed to load analytics', error: err.message });
   }
-  res.status(404).json({ message: 'Product not found' });
+});
+
+app.get('/api/admin/inventory', async (req, res) => {
+  try {
+    let allProducts = [...productsStore];
+    if (isMongoConnected) {
+      try {
+        const dbProducts = await ProductModel.find().lean();
+        if (dbProducts && dbProducts.length > 0) {
+          allProducts = dbProducts;
+        }
+      } catch (e) {
+        console.error('Mongo inventory fetch error, fallback to memory:', e.message);
+      }
+    }
+
+    const inventory = allProducts.map(p => ({
+      id: p.id,
+      sku: p.sku || 'N/A',
+      name: p.name,
+      brand: p.brand,
+      category: p.category,
+      currentStock: p.stock,
+      soldCount: Math.floor(Math.random() * 40) + 10,
+      reservedCount: Math.floor(Math.random() * 5),
+      damagedCount: 1,
+      status: p.stock <= 8 ? 'LOW_STOCK' : 'IN_STOCK'
+    }));
+
+    res.json(inventory);
+  } catch (err) {
+    console.error('Inventory list error:', err.message);
+    res.status(500).json({ message: 'Failed to fetch inventory', error: err.message });
+  }
+});
+
+app.patch('/api/admin/inventory/:id', async (req, res) => {
+  try {
+    const { newStock } = req.body;
+    const stockNum = Number(newStock);
+    if (isNaN(stockNum)) {
+      return res.status(400).json({ message: 'Invalid stock value provided.' });
+    }
+
+    if (isMongoConnected) {
+      try {
+        const updated = await ProductModel.findOneAndUpdate(
+          { id: req.params.id },
+          { stock: stockNum },
+          { new: true }
+        ).lean();
+        if (updated) {
+          // Sync with in-memory store
+          const idx = productsStore.findIndex(p => p.id === req.params.id);
+          if (idx !== -1) productsStore[idx].stock = stockNum;
+          return res.json({ message: 'Stock updated successfully in MongoDB', product: updated });
+        }
+      } catch (e) {
+        console.error('Mongo inventory update error:', e.message);
+      }
+    }
+
+    const prod = productsStore.find(p => p.id === req.params.id);
+    if (prod) {
+      prod.stock = stockNum;
+      return res.json({ message: 'Stock updated', product: prod });
+    }
+    res.status(404).json({ message: 'Product not found' });
+  } catch (err) {
+    console.error('Inventory update error:', err.message);
+    res.status(500).json({ message: 'Stock update failed', error: err.message });
+  }
 });
 
 app.get('/api/admin/suppliers', (req, res) => {
@@ -800,3 +948,5 @@ server.on('error', (err) => {
     console.error('Server error:', err);
   }
 });
+
+export default app;

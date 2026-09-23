@@ -135,19 +135,21 @@ export async function sendOrderConfirmationEmail({ order, pdfBuffer }) {
 export async function sendAdminOrderNotificationEmail({ order }) {
   const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER || 'mdmonirhossion2002@gmail.com';
 
+  const senderEmail = process.env.EMAIL_USER || 'mdmonirhossion2002@gmail.com';
+
   const mailOptions = {
-    from: `"TechCore System" <${process.env.EMAIL_USER}>`,
+    from: `"TechCore System" <${senderEmail}>`,
     to: adminEmail,
-    subject: `🔔 New Order Received - #${order.id} (৳${order.grandTotal.toLocaleString()})`,
+    subject: `🔔 New Order Received - #${order.id || 'N/A'} (৳${(order.grandTotal || 0).toLocaleString()})`,
     html: `
       <div style="font-family: Arial, sans-serif; background-color: #0b0f17; color: #ffffff; padding: 20px; border-radius: 8px;">
         <h2 style="color: #00f2fe;">New Store Order Notification</h2>
-        <p><strong>Order ID:</strong> #${order.id}</p>
-        <p><strong>Customer Name:</strong> ${order.customer?.name} (${order.customer?.phone})</p>
-        <p><strong>Email:</strong> ${order.customer?.email}</p>
-        <p><strong>Shipping Zone:</strong> ${order.customer?.zone}</p>
-        <p><strong>Grand Total:</strong> ৳${order.grandTotal.toLocaleString()} BDT</p>
-        <p><strong>Payment Method:</strong> ${order.paymentMethod} (${order.paymentStatus})</p>
+        <p><strong>Order ID:</strong> #${order.id || 'N/A'}</p>
+        <p><strong>Customer Name:</strong> ${order.customer?.name || 'Customer'} (${order.customer?.phone || 'N/A'})</p>
+        <p><strong>Email:</strong> ${order.customer?.email || 'N/A'}</p>
+        <p><strong>Shipping Zone:</strong> ${order.customer?.zone || 'N/A'}</p>
+        <p><strong>Grand Total:</strong> ৳${(order.grandTotal || 0).toLocaleString()} BDT</p>
+        <p><strong>Payment Method:</strong> ${order.paymentMethod || 'COD'} (${order.paymentStatus || 'Pending'})</p>
       </div>
     `
   };

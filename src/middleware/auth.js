@@ -35,6 +35,9 @@ export const verifyToken = async (req, res, next) => {
 export const requireApprovedAdmin = async (req, res, next) => {
   await verifyToken(req, res, () => {
     const user = req.user;
+    if (!user) {
+      return res.status(401).json({ message: 'Authentication required. User context invalid.' });
+    }
 
     // Super Admin is always approved
     if (user.role === 'SUPER_ADMIN') {

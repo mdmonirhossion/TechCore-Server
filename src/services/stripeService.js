@@ -12,9 +12,14 @@ export function getStripe() {
  */
 export async function createStripePaymentIntent(amountInBdt, customerEmail) {
   try {
+    const numericAmount = Number(amountInBdt);
+    if (isNaN(numericAmount) || numericAmount <= 0) {
+      throw new Error(`Invalid amount provided for payment intent: ${amountInBdt}`);
+    }
+
     const stripe = getStripe();
     // Convert BDT to USD cents for Stripe Card processing (1 USD ~ 115 BDT)
-    const amountInUsdCents = Math.max(100, Math.round((amountInBdt / 115) * 100));
+    const amountInUsdCents = Math.max(100, Math.round((numericAmount / 115) * 100));
 
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountInUsdCents,
@@ -23,7 +28,7 @@ export async function createStripePaymentIntent(amountInBdt, customerEmail) {
       receipt_email: customerEmail && customerEmail.includes('@') ? customerEmail : undefined,
       metadata: {
         integration: 'TechCore E-Commerce',
-        amountInBdt: String(amountInBdt)
+        amountInBdt: String(numericAmount)
       }
     });
 
