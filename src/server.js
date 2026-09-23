@@ -261,7 +261,7 @@ app.post('/api/auth/register', async (req, res) => {
     });
 
     const jwtSecret = process.env.JWT_SECRET || 'techcore_super_secret_jwt_key_2026';
-    const token = jwt.sign({ id: newUser._id, role: newUser.role }, jwtSecret, { expiresIn: '7d' });
+    const token = jwt.sign({ id: newUser._id, role: newUser.role, email: newUser.email }, jwtSecret, { expiresIn: '7d' });
 
     res.status(201).json({
       message: requestedRole === 'CO_ADMIN'
@@ -304,7 +304,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const jwtSecret = process.env.JWT_SECRET || 'techcore_super_secret_jwt_key_2026';
-    const token = jwt.sign({ id: user._id, role: user.role }, jwtSecret, { expiresIn: '7d' });
+    const token = jwt.sign({ id: user._id, role: user.role, email: user.email }, jwtSecret, { expiresIn: '7d' });
 
     res.json({
       message: 'Login successful!',
