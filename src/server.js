@@ -23,6 +23,36 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Global Security, CORS & Content Security Policy (CSP) Headers Middleware
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' https://vercel.live; connect-src * 'unsafe-inline' https://vercel.live; img-src * data: blob:; style-src * 'unsafe-inline';"
+  );
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  next();
+});
+
+// Root Health & Welcome Route
+app.get('/', (req, res) => {
+  res.status(200).json({
+    success: true,
+    name: 'TechCore Server API',
+    status: 'Online ⚡',
+    version: '1.0.0',
+    message: 'TechCore Backend API is active and running smoothly.',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Silence favicon.ico 404 logs in browser console
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // Chrome DevTools background request handling to silence 404/CSP logs
 app.get('/.well-known/appspecific/com.chrome.devtools.json', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -931,6 +961,14 @@ app.post('/api/admin/suppliers', (req, res) => {
   const newSupplier = { id: `sup-${suppliersStore.length + 1}`, ...req.body };
   suppliersStore.push(newSupplier);
   res.status(201).json(newSupplier);
+});
+
+// 404 Fallback JSON Handler for Unmatched Routes (prevents 404 HTML & Vercel live script errors)
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `API endpoint '${req.originalUrl}' not found on TechCore Server.`
+  });
 });
 
 const server = app.listen(PORT, () => {
