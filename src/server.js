@@ -378,10 +378,10 @@ app.get('/api/products', async (req, res) => {
 
   let filtered = [...productsStore];
 
-  // If MongoDB is active, fetch from Mongo
+  // If MongoDB is active, fetch from Mongo sorted by newest
   if (isMongoConnected) {
     try {
-      const dbProducts = await ProductModel.find().lean();
+      const dbProducts = await ProductModel.find().sort({ createdAt: -1 }).lean();
       if (dbProducts && dbProducts.length > 0) {
         filtered = dbProducts;
       }
@@ -391,37 +391,37 @@ app.get('/api/products', async (req, res) => {
   }
 
   if (category) {
-    filtered = filtered.filter(p => p.categorySlug === category || p.category.toLowerCase() === category.toLowerCase());
+    filtered = filtered.filter(p => (p.categorySlug && p.categorySlug === category) || (p.category && p.category.toLowerCase() === category.toLowerCase()));
   }
 
   if (brand) {
-    filtered = filtered.filter(p => p.brand.toLowerCase() === brand.toLowerCase());
+    filtered = filtered.filter(p => p.brand && p.brand.toLowerCase() === brand.toLowerCase());
   }
 
   if (minPrice) {
-    filtered = filtered.filter(p => p.discountPrice >= Number(minPrice));
+    filtered = filtered.filter(p => (p.discountPrice !== undefined ? p.discountPrice : p.price) >= Number(minPrice));
   }
 
   if (maxPrice) {
-    filtered = filtered.filter(p => p.discountPrice <= Number(maxPrice));
+    filtered = filtered.filter(p => (p.discountPrice !== undefined ? p.discountPrice : p.price) <= Number(maxPrice));
   }
 
   if (search) {
     const q = search.toLowerCase();
     filtered = filtered.filter(p =>
-      p.name.toLowerCase().includes(q) ||
-      p.brand.toLowerCase().includes(q) ||
-      p.category.toLowerCase().includes(q) ||
-      (p.tags && p.tags.some(t => t.toLowerCase().includes(q)))
+      (p.name && p.name.toLowerCase().includes(q)) ||
+      (p.brand && p.brand.toLowerCase().includes(q)) ||
+      (p.category && p.category.toLowerCase().includes(q)) ||
+      (p.tags && p.tags.some(t => t && t.toLowerCase().includes(q)))
     );
   }
 
   if (sort === 'price-low') {
-    filtered.sort((a, b) => a.discountPrice - b.discountPrice);
+    filtered.sort((a, b) => (a.discountPrice || a.price) - (b.discountPrice || b.price));
   } else if (sort === 'price-high') {
-    filtered.sort((a, b) => b.discountPrice - a.discountPrice);
+    filtered.sort((a, b) => (b.discountPrice || b.price) - (a.discountPrice || a.price));
   } else if (sort === 'rating') {
-    filtered.sort((a, b) => b.rating - a.rating);
+    filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0));
   }
 
   res.json({
@@ -509,22 +509,52 @@ app.get('/api/products/compare', async (req, res) => {
 // Product Creation (Protected: Super Admin OR Approved Co-Admin Only)
 app.post('/api/products', requireApprovedAdmin, async (req, res) => {
   try {
-    const newProd = req.body;
-    if (!newProd.id || !newProd.name || !newProd.price) {
-      return res.status(400).json({ message: 'Missing required product fields (id, name, price).' });
+    const body = req.body || {};
+    if (!body.name || body.price === undefined) {
+      return res.status(400).json({ message: 'Missing required product fields: name and price are required.' });
     }
+
+    const priceNum = Number(body.price);
+    const discountPriceNum = body.discountPrice !== undefined ? Number(body.discountPrice) : priceNum;
+    const catName = body.category || 'General';
+    const catSlug = body.categorySlug || catName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+
+    const newProd = {
+      id: body.id || `prod-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      name: body.name.trim(),
+      sku: body.sku || `SKU-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      brand: body.brand || 'Generic',
+      category: catName,
+      categorySlug: catSlug,
+      builderCategory: body.builderCategory || undefined,
+      price: priceNum,
+      discountPrice: discountPriceNum,
+      stock: body.stock !== undefined ? Number(body.stock) : 10,
+      images: Array.isArray(body.images) && body.images.length > 0 
+        ? body.images 
+        : [body.image || 'https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?w=600&auto=format&fit=crop'],
+      description: body.description || `${body.name} high quality tech product.`,
+      specifications: body.specifications || {},
+      warranty: body.warranty || '1 Year',
+      rating: body.rating !== undefined ? Number(body.rating) : 5.0,
+      reviewsCount: body.reviewsCount !== undefined ? Number(body.reviewsCount) : 0,
+      isFlashSale: Boolean(body.isFlashSale),
+      flashSalePrice: body.flashSalePrice ? Number(body.flashSalePrice) : undefined,
+      tags: Array.isArray(body.tags) ? body.tags : [body.brand || 'TechCore', catName]
+    };
 
     if (isMongoConnected) {
       const created = await ProductModel.create(newProd);
-      productsStore.unshift(created.toObject());
-      return res.status(201).json(created);
+      const createdObj = created.toObject();
+      productsStore.unshift(createdObj);
+      return res.status(201).json(createdObj);
     }
 
     productsStore.unshift(newProd);
     res.status(201).json(newProd);
   } catch (err) {
-    console.error('Product Creation Error:', err.message);
-    res.status(500).json({ message: 'Failed to create product', error: err.message });
+    console.error('Product Creation Error:', err);
+    res.status(500).json({ message: 'Failed to create product in MongoDB', error: err.message });
   }
 });
 
