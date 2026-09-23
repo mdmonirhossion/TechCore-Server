@@ -59,12 +59,17 @@ app.use(async (req, res, next) => {
 
 // Root Health & Welcome Route
 app.get('/', (req, res) => {
+  const active = isMongoActive();
   res.status(200).json({
     success: true,
     name: 'TechCore Server API',
     status: 'Online ⚡',
+    database: {
+      connected: active,
+      readyState: mongoose.connection.readyState,
+      provider: active ? 'MongoDB Atlas 🍃' : 'In-Memory RAM Store ⚠️ (Set MONGODB_URI in Vercel settings)'
+    },
     version: '1.0.0',
-    message: 'TechCore Backend API is active and running smoothly.',
     timestamp: new Date().toISOString()
   });
 });
@@ -107,6 +112,7 @@ app.post('/api/create-payment-intent', async (req, res) => {
 
 // Connect to MongoDB Atlas
 let isMongoConnected = false;
+const isMongoActive = () => mongoose.connection.readyState === 1 || isMongoConnected;
 
 const seedSuperAdmin = async () => {
   try {
@@ -399,10 +405,10 @@ app.patch('/api/admin/reject-admin/:id', requireSuperAdmin, async (req, res) => 
 app.get('/api/products', async (req, res) => {
   const { category, brand, minPrice, maxPrice, search, sort } = req.query;
 
-  let filtered = [...productsStore];
+  let filtered = [];
 
   // If MongoDB is active, fetch from Mongo sorted by newest
-  if (isMongoConnected) {
+  if (isMongoActive()) {
     try {
       const dbProducts = await ProductModel.find().sort({ createdAt: -1 }).lean();
       if (dbProducts && dbProducts.length > 0) {
@@ -411,6 +417,11 @@ app.get('/api/products', async (req, res) => {
     } catch (e) {
       console.error('Mongo fetch error, fallback to memory:', e.message);
     }
+  }
+
+  // Fallback to in-memory store if Mongo is not connected or returned empty
+  if (filtered.length === 0) {
+    filtered = [...productsStore];
   }
 
   if (category) {
@@ -462,7 +473,7 @@ app.get('/api/products/search', async (req, res) => {
     }
 
     let matchingProducts = [];
-    if (isMongoConnected) {
+    if (isMongoActive()) {
       try {
         const regex = new RegExp(q, 'i');
         matchingProducts = await ProductModel.find({
@@ -514,7 +525,7 @@ app.get('/api/products/compare', async (req, res) => {
   const ids = (req.query.ids || '').split(',').filter(Boolean);
   if (ids.length === 0) return res.json({ products: [] });
 
-  if (isMongoConnected) {
+  if (isMongoActive()) {
     try {
       const dbMatched = await ProductModel.find({ id: { $in: ids } }).lean();
       if (dbMatched && dbMatched.length > 0) {
@@ -566,13 +577,15 @@ app.post('/api/products', requireApprovedAdmin, async (req, res) => {
       tags: Array.isArray(body.tags) ? body.tags : [body.brand || 'TechCore', catName]
     };
 
-    if (isMongoConnected) {
+    if (isMongoActive()) {
       const created = await ProductModel.create(newProd);
       const createdObj = created.toObject();
       productsStore.unshift(createdObj);
+      console.log(`✅ Product created and saved in MongoDB Atlas: ${createdObj.name} (${createdObj.id})`);
       return res.status(201).json(createdObj);
     }
 
+    console.warn(`⚠️ Mongo not connected. Product created in memory RAM store: ${newProd.name}`);
     productsStore.unshift(newProd);
     res.status(201).json(newProd);
   } catch (err) {
