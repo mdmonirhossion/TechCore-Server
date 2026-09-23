@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 
 import { connectDB } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
@@ -33,7 +34,25 @@ app.use((req, res, next) => {
     "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' https://vercel.live; connect-src * 'unsafe-inline' https://vercel.live; img-src * data: blob:; style-src * 'unsafe-inline';"
   );
   if (req.method === 'OPTIONS') {
-    return res.status(200).end();
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(200).json({ status: 'ok' });
+  }
+  next();
+});
+
+// Middleware to ensure DB connection completes before processing any API route (solves Vercel serverless cold-start race conditions)
+app.use(async (req, res, next) => {
+  if (process.env.MONGODB_URI && mongoose.connection.readyState !== 1) {
+    try {
+      isMongoConnected = await connectDB();
+      if (isMongoConnected) {
+        await seedSuperAdmin();
+      }
+    } catch (e) {
+      console.error('Auto DB Connection Middleware Error:', e.message);
+    }
+  } else if (mongoose.connection.readyState === 1) {
+    isMongoConnected = true;
   }
   next();
 });
@@ -51,12 +70,16 @@ app.get('/', (req, res) => {
 });
 
 // Silence favicon.ico 404 logs in browser console
-app.get('/favicon.ico', (req, res) => res.status(204).end());
+app.get('/favicon.ico', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json({ status: 'ok' });
+});
 
 // Chrome DevTools background request handling to silence 404/CSP logs
 app.get('/.well-known/appspecific/com.chrome.devtools.json', (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.status(204).end();
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json({ status: 'ok', devtools: true });
 });
 
 // -------------------------------------------------------------
