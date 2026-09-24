@@ -541,7 +541,7 @@ app.get('/api/products/compare', async (req, res) => {
 });
 
 // Product Creation (Protected: Super Admin OR Approved Co-Admin Only)
-app.post('/api/products', requireApprovedAdmin, async (req, res) => {
+app.post(['/api/products', '/api/admin/products'], requireApprovedAdmin, async (req, res) => {
   try {
     const body = req.body || {};
     if (!body.name || body.price === undefined) {
@@ -595,15 +595,19 @@ app.post('/api/products', requireApprovedAdmin, async (req, res) => {
 });
 
 // Product Update (Protected: Super Admin OR Approved Co-Admin Only)
-app.put('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+app.put(['/api/products/:id', '/api/admin/products/:id'], requireApprovedAdmin, async (req, res) => {
   try {
-    if (isMongoConnected) {
+    if (isMongoActive()) {
       const updated = await ProductModel.findOneAndUpdate(
         { id: req.params.id },
         req.body,
         { new: true }
       ).lean();
-      if (updated) return res.json(updated);
+      if (updated) {
+        const idx = productsStore.findIndex(p => p.id === req.params.id);
+        if (idx !== -1) productsStore[idx] = updated;
+        return res.json(updated);
+      }
     }
 
     const idx = productsStore.findIndex(p => p.id === req.params.id);
@@ -620,9 +624,9 @@ app.put('/api/products/:id', requireApprovedAdmin, async (req, res) => {
 });
 
 // Product Deletion (Protected: Super Admin OR Approved Co-Admin Only)
-app.delete('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+app.delete(['/api/products/:id', '/api/admin/products/:id'], requireApprovedAdmin, async (req, res) => {
   try {
-    if (isMongoConnected) {
+    if (isMongoActive()) {
       await ProductModel.deleteOne({ id: req.params.id });
     }
     productsStore = productsStore.filter(p => p.id !== req.params.id);
