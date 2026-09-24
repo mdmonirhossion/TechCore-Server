@@ -5,7 +5,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 
-import { connectDB } from './config/db.js';
+import { connectDB, getLastMongoError } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
 import { ProductModel } from './models/Product.js';
 import { OrderModel } from './models/Order.js';
@@ -60,6 +60,7 @@ app.use(async (req, res, next) => {
 // Root Health & Welcome Route
 app.get('/', (req, res) => {
   const active = isMongoActive();
+  const dbErr = getLastMongoError();
   res.status(200).json({
     success: true,
     name: 'TechCore Server API',
@@ -67,7 +68,13 @@ app.get('/', (req, res) => {
     database: {
       connected: active,
       readyState: mongoose.connection.readyState,
-      provider: active ? 'MongoDB Atlas 🍃' : 'In-Memory RAM Store ⚠️ (Set MONGODB_URI in Vercel settings)'
+      hasEnvVar: Boolean(process.env.MONGODB_URI),
+      provider: active ? 'MongoDB Atlas 🍃' : 'In-Memory RAM Store ⚠️',
+      diagnosticNotice: active
+        ? 'MongoDB Atlas Connected Successfully'
+        : (!process.env.MONGODB_URI
+            ? 'MONGODB_URI environment variable is missing in Vercel Settings -> Environment Variables'
+            : (dbErr || 'MongoDB Atlas IP Whitelist (0.0.0.0/0) or Connection Timeout issue'))
     },
     version: '1.0.0',
     timestamp: new Date().toISOString()
