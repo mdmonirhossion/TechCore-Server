@@ -1,3 +1,5 @@
+import { slugify } from '../utils/slugify.js';
+
 export const categories = [
   { id: 'cat-cpu', name: 'Processor', slug: 'processor', icon: 'Cpu' },
   { id: 'cat-gpu', name: 'Graphics Card', slug: 'gpu', icon: 'Tv' },
@@ -16,7 +18,7 @@ export const brands = [
   'ASUS', 'MSI', 'Gigabyte', 'AMD', 'Intel', 'Corsair', 'Lenovo', 'Apple', 'HP', 'G.Skill', 'Deepcool', 'Samsung'
 ];
 
-export const products = [
+const rawProducts = [
   {
     id: 'prod-101',
     name: 'AMD Ryzen 7 7800X3D Gaming Processor',
@@ -492,8 +494,14 @@ export const products = [
     reviewsCount: 25,
     isFlashSale: false,
     tags: ['Deepcool', 'AK620', 'CPU Cooler']
-  }
 ];
+
+export const products = rawProducts.map(p => ({
+  ...p,
+  slug: p.slug || slugify(p.name),
+  stockStatus: p.stockStatus || (p.stock > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK'),
+  emiAvailable: p.emiAvailable !== undefined ? p.emiAvailable : true
+}));
 
 export const sampleServiceRequests = [
   {

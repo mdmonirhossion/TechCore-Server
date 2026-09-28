@@ -19,13 +19,30 @@ const productSchema = new mongoose.Schema({
   reviewsCount: { type: Number, default: 0 },
   isFlashSale: { type: Boolean, default: false },
   flashSalePrice: { type: Number },
+  slug: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  stockStatus: {
+    type: String,
+    enum: ['IN_STOCK', 'OUT_OF_STOCK', 'PRE_ORDER', 'UP_COMING'],
+    default: 'IN_STOCK'
+  },
+  emiAvailable: { type: Boolean, default: true },
+  isFeatured: { type: Boolean, default: false },
+  seoTitle: { type: String },
+  seoDescription: { type: String },
+  seoKeywords: [{ type: String }],
+  categoryId: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null },
+  brandId: { type: mongoose.Schema.Types.ObjectId, ref: 'Brand', default: null },
   tags: [{ type: String }]
 }, { timestamps: true });
 
 // High-concurrency database indexing for Star-Tech style fast search & filter
+productSchema.index({ slug: 1 });
 productSchema.index({ categorySlug: 1 });
+productSchema.index({ categoryId: 1 });
 productSchema.index({ brand: 1 });
+productSchema.index({ brandId: 1 });
 productSchema.index({ price: 1 });
+productSchema.index({ stockStatus: 1 });
 productSchema.index({ builderCategory: 1 });
 productSchema.index({ name: 'text', brand: 'text', category: 'text', tags: 'text' });
 

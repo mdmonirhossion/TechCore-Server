@@ -12,6 +12,15 @@ import { OrderModel } from './models/Order.js';
 import { UserModel } from './models/User.js';
 import { verifyToken, requireApprovedAdmin, requireSuperAdmin } from './middleware/auth.js';
 
+import { CategoryModel } from './models/Category.js';
+import { BrandModel } from './models/Brand.js';
+import { BlogModel } from './models/Blog.js';
+import { FaqModel } from './models/Faq.js';
+import { HomeSEOModel } from './models/HomeSEO.js';
+import { SlugRedirectModel } from './models/SlugRedirect.js';
+import { slugify, generateUniqueSlug } from './utils/slugify.js';
+import { runCategoryBrandMigration } from './scripts/migrateCategoriesAndBrands.js';
+
 import { categories, brands, products as initialProducts, sampleServiceRequests, sampleSuppliers } from './data/seedData.js';
 import { evaluatePcBuild } from './services/compatibilityEngine.js';
 import { createStripePaymentIntent } from './services/stripeService.js';
@@ -164,8 +173,9 @@ connectDB().then(async (connected) => {
       } else {
         console.log(`📦 MongoDB Atlas contains ${count} products.`);
       }
+      await runCategoryBrandMigration();
     } catch (err) {
-      console.error('Seed check error:', err.message);
+      console.error('Seed/Migration check error:', err.message);
     }
   }
 });
@@ -439,9 +449,15 @@ const normalizeProduct = (p) => {
   const imagesArr = Array.isArray(p.images) && p.images.length > 0 
     ? p.images 
     : (p.image ? [p.image] : ['https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?w=600&auto=format&fit=crop']);
+  const slugVal = p.slug || slugify(p.name || 'product');
+  const stockStatusVal = p.stockStatus || (stockVal > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK');
 
   return {
     ...p,
+    slug: slugVal,
+    stockStatus: stockStatusVal,
+    emiAvailable: p.emiAvailable !== undefined ? p.emiAvailable : true,
+    isFeatured: Boolean(p.isFeatured),
     stock: stockVal,
     currentStock: stockVal,
     images: imagesArr,
@@ -450,43 +466,82 @@ const normalizeProduct = (p) => {
 };
 
 app.get('/api/products', async (req, res) => {
-  const { category, brand, minPrice, maxPrice, search, sort } = req.query;
+  const { category, brand, minPrice, maxPrice, search, sort, stockStatus, page = 1, limit = 12 } = req.query;
+
+  const pageNum = Math.max(1, parseInt(page) || 1);
+  const limitNum = Math.max(1, Math.min(100, parseInt(limit) || 12));
 
   let filtered = [];
 
-  // If MongoDB is active, fetch from Mongo sorted by newest
   if (isMongoActive()) {
     try {
-      const dbProducts = await ProductModel.find().sort({ createdAt: -1 }).lean();
-      if (dbProducts && dbProducts.length > 0) {
-        filtered = dbProducts;
+      const query = {};
+      if (category) {
+        query.$or = [{ categorySlug: category }, { category: new RegExp(`^${category}$`, 'i') }];
       }
+      if (brand) {
+        query.brand = new RegExp(`^${brand}$`, 'i');
+      }
+      if (stockStatus) {
+        query.stockStatus = stockStatus;
+      }
+      if (minPrice || maxPrice) {
+        query.price = {};
+        if (minPrice) query.price.$gte = Number(minPrice);
+        if (maxPrice) query.price.$lte = Number(maxPrice);
+      }
+      if (search) {
+        const regex = new RegExp(search.trim(), 'i');
+        query.$or = [
+          { name: regex },
+          { brand: regex },
+          { category: regex },
+          { tags: { $in: [regex] } }
+        ];
+      }
+
+      let sortOptions = { createdAt: -1 };
+      if (sort === 'price-low') sortOptions = { discountPrice: 1, price: 1 };
+      else if (sort === 'price-high') sortOptions = { discountPrice: -1, price: -1 };
+      else if (sort === 'rating') sortOptions = { rating: -1 };
+
+      const totalItems = await ProductModel.countDocuments(query);
+      const dbProducts = await ProductModel.find(query)
+        .sort(sortOptions)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean();
+
+      return res.json({
+        total: totalItems,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.ceil(totalItems / limitNum) || 1,
+        products: dbProducts.map(normalizeProduct)
+      });
     } catch (e) {
       console.error('Mongo fetch error, fallback to memory:', e.message);
     }
   }
 
-  // Fallback to in-memory store if Mongo is not connected or returned empty
-  if (filtered.length === 0) {
-    filtered = [...productsStore];
-  }
+  // Fallback to in-memory store
+  filtered = productsStore.map(normalizeProduct);
 
   if (category) {
     filtered = filtered.filter(p => (p.categorySlug && p.categorySlug === category) || (p.category && p.category.toLowerCase() === category.toLowerCase()));
   }
-
   if (brand) {
     filtered = filtered.filter(p => p.brand && p.brand.toLowerCase() === brand.toLowerCase());
   }
-
+  if (stockStatus) {
+    filtered = filtered.filter(p => p.stockStatus === stockStatus);
+  }
   if (minPrice) {
     filtered = filtered.filter(p => (p.discountPrice !== undefined ? p.discountPrice : p.price) >= Number(minPrice));
   }
-
   if (maxPrice) {
     filtered = filtered.filter(p => (p.discountPrice !== undefined ? p.discountPrice : p.price) <= Number(maxPrice));
   }
-
   if (search) {
     const q = search.toLowerCase();
     filtered = filtered.filter(p =>
@@ -505,10 +560,44 @@ app.get('/api/products', async (req, res) => {
     filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0));
   }
 
+  const totalItems = filtered.length;
+  const paginated = filtered.slice((pageNum - 1) * limitNum, pageNum * limitNum);
+
   res.json({
-    total: filtered.length,
-    products: filtered.map(normalizeProduct)
+    total: totalItems,
+    page: pageNum,
+    limit: limitNum,
+    totalPages: Math.ceil(totalItems / limitNum) || 1,
+    products: paginated
   });
+});
+
+// Product detail by unique SLUG (Supports 301 Redirects for modified slugs)
+app.get('/api/products/slug/:slug', async (req, res) => {
+  const { slug } = req.params;
+  const targetSlug = slug.toLowerCase().trim();
+
+  if (isMongoActive()) {
+    try {
+      const redirect = await SlugRedirectModel.findOne({ oldSlug: targetSlug }).lean();
+      if (redirect) {
+        return res.status(301).json({
+          redirect: true,
+          statusCode: 301,
+          redirectTo: redirect.targetUrl || `/product/${redirect.newSlug}`,
+          newSlug: redirect.newSlug
+        });
+      }
+      const dbP = await ProductModel.findOne({ slug: targetSlug }).lean();
+      if (dbP) return res.json(normalizeProduct(dbP));
+    } catch (e) {
+      console.error('Mongo product slug query error:', e.message);
+    }
+  }
+
+  const p = productsStore.find(item => (item.slug && item.slug === targetSlug) || slugify(item.name) === targetSlug);
+  if (!p) return res.status(404).json({ message: 'Product not found with slug: ' + slug });
+  res.json(normalizeProduct(p));
 });
 
 // Search suggestions & auto-complete multi-field engine
@@ -703,12 +792,393 @@ app.get('/api/products/:id', async (req, res) => {
   res.json(normalizeProduct(product));
 });
 
-app.get('/api/categories', (req, res) => {
-  res.json(categories);
+app.get('/api/categories/tree', async (req, res) => {
+  try {
+    let allCats = [];
+    if (isMongoActive()) {
+      allCats = await CategoryModel.find({ isActive: true }).sort({ order: 1, name: 1 }).lean();
+    }
+
+    if (!allCats || allCats.length === 0) {
+      allCats = categories.map((c, idx) => ({
+        _id: c.id,
+        name: c.name,
+        slug: c.slug,
+        parent: null,
+        level: 1,
+        icon: c.icon,
+        order: idx,
+        isFeatured: true,
+        isActive: true
+      }));
+    }
+
+    const categoryMap = {};
+    allCats.forEach(cat => {
+      categoryMap[cat._id.toString()] = { ...cat, children: [] };
+    });
+
+    const tree = [];
+    allCats.forEach(cat => {
+      const catObj = categoryMap[cat._id.toString()];
+      if (cat.parent && categoryMap[cat.parent.toString()]) {
+        categoryMap[cat.parent.toString()].children.push(catObj);
+      } else {
+        tree.push(catObj);
+      }
+    });
+
+    res.json(tree);
+  } catch (err) {
+    console.error('Category tree fetch error:', err);
+    res.status(500).json({ message: 'Failed to fetch category tree', error: err.message });
+  }
 });
 
-app.get('/api/brands', (req, res) => {
-  res.json(brands);
+app.get('/api/categories', async (req, res) => {
+  try {
+    if (isMongoActive()) {
+      const dbCats = await CategoryModel.find({ isActive: true }).sort({ order: 1 }).lean();
+      if (dbCats && dbCats.length > 0) return res.json(dbCats);
+    }
+    res.json(categories);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch categories', error: err.message });
+  }
+});
+
+app.get('/api/categories/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    if (isMongoActive()) {
+      const cat = await CategoryModel.findOne({ slug: slug.toLowerCase() }).lean();
+      if (cat) return res.json(cat);
+    }
+    const seedCat = categories.find(c => c.slug === slug.toLowerCase());
+    if (seedCat) return res.json(seedCat);
+    res.status(404).json({ message: 'Category not found' });
+  } catch (err) {
+    res.status(500).json({ message: 'Category fetch error', error: err.message });
+  }
+});
+
+app.get('/api/brands', async (req, res) => {
+  try {
+    if (isMongoActive()) {
+      const dbBrands = await BrandModel.find().sort({ name: 1 }).lean();
+      if (dbBrands && dbBrands.length > 0) return res.json(dbBrands);
+    }
+    const mappedSeedBrands = brands.map(b => ({
+      name: b,
+      slug: slugify(b),
+      isFeatured: true
+    }));
+    res.json(mappedSeedBrands);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch brands', error: err.message });
+  }
+});
+
+app.get('/api/brands/grouped', async (req, res) => {
+  try {
+    let brandList = [];
+    if (isMongoActive()) {
+      brandList = await BrandModel.find().sort({ name: 1 }).lean();
+    }
+
+    if (!brandList || brandList.length === 0) {
+      brandList = brands.map(b => ({
+        name: b,
+        slug: slugify(b),
+        isFeatured: true
+      }));
+    }
+
+    const grouped = {};
+    brandList.forEach(b => {
+      const firstChar = (b.name[0] || '#').toUpperCase();
+      if (!grouped[firstChar]) {
+        grouped[firstChar] = [];
+      }
+      grouped[firstChar].push(b);
+    });
+
+    res.json(grouped);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch grouped brands', error: err.message });
+  }
+});
+
+// Category Admin CRUD (Protected)
+app.post('/api/admin/categories', requireApprovedAdmin, async (req, res) => {
+  try {
+    const { name, parent, icon, image, order, isFeatured, isActive, seoTitle, seoDescription } = req.body;
+    if (!name) return res.status(400).json({ message: 'Category name is required' });
+
+    let level = 1;
+    if (parent) {
+      const parentCat = await CategoryModel.findById(parent);
+      if (parentCat) {
+        level = Math.min(4, parentCat.level + 1);
+      }
+    }
+
+    const slug = await generateUniqueSlug(CategoryModel, name);
+    const newCat = await CategoryModel.create({
+      name,
+      slug,
+      parent: parent || null,
+      level,
+      icon: icon || '',
+      image: image || '',
+      order: Number(order) || 0,
+      isFeatured: Boolean(isFeatured),
+      isActive: isActive !== undefined ? Boolean(isActive) : true,
+      seoTitle: seoTitle || '',
+      seoDescription: seoDescription || ''
+    });
+
+    res.status(201).json(newCat);
+  } catch (err) {
+    res.status(500).json({ message: 'Category creation failed', error: err.message });
+  }
+});
+
+app.put('/api/admin/categories/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    const body = req.body;
+    if (body.parent) {
+      const parentCat = await CategoryModel.findById(body.parent);
+      if (parentCat) {
+        body.level = Math.min(4, parentCat.level + 1);
+      }
+    }
+
+    const updated = await CategoryModel.findByIdAndUpdate(req.params.id, body, { new: true });
+    if (!updated) return res.status(404).json({ message: 'Category not found' });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ message: 'Category update failed', error: err.message });
+  }
+});
+
+app.delete('/api/admin/categories/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    const childCount = await CategoryModel.countDocuments({ parent: req.params.id });
+    if (childCount > 0) {
+      return res.status(400).json({ message: `Cannot delete category: it contains ${childCount} subcategories.` });
+    }
+    await CategoryModel.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Category deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Category deletion failed', error: err.message });
+  }
+});
+
+// Brand Admin CRUD (Protected)
+app.post('/api/admin/brands', requireApprovedAdmin, async (req, res) => {
+  try {
+    const { name, logo, banner, description, isFeatured, isExclusiveDistributor, seoTitle, seoDescription } = req.body;
+    if (!name) return res.status(400).json({ message: 'Brand name is required' });
+
+    const slug = await generateUniqueSlug(BrandModel, name);
+    const newBrand = await BrandModel.create({
+      name,
+      slug,
+      logo: logo || '',
+      banner: banner || '',
+      description: description || '',
+      isFeatured: Boolean(isFeatured),
+      isExclusiveDistributor: Boolean(isExclusiveDistributor),
+      seoTitle: seoTitle || '',
+      seoDescription: seoDescription || ''
+    });
+
+    res.status(201).json(newBrand);
+  } catch (err) {
+    res.status(500).json({ message: 'Brand creation failed', error: err.message });
+  }
+});
+
+app.put('/api/admin/brands/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    const updated = await BrandModel.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    if (!updated) return res.status(404).json({ message: 'Brand not found' });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ message: 'Brand update failed', error: err.message });
+  }
+});
+
+app.delete('/api/admin/brands/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    await BrandModel.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Brand deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Brand deletion failed', error: err.message });
+  }
+});
+
+// Blog Endpoints
+app.get('/api/blog', async (req, res) => {
+  try {
+    const pageNum = Math.max(1, parseInt(req.query.page) || 1);
+    const limitNum = Math.max(1, parseInt(req.query.limit) || 10);
+
+    let posts = [];
+    let total = 0;
+
+    if (isMongoActive()) {
+      total = await BlogModel.countDocuments({ status: 'PUBLISHED' });
+      posts = await BlogModel.find({ status: 'PUBLISHED' })
+        .sort({ createdAt: -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean();
+    }
+
+    res.json({
+      total,
+      page: pageNum,
+      limit: limitNum,
+      totalPages: Math.ceil(total / limitNum) || 1,
+      posts
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch blog posts', error: err.message });
+  }
+});
+
+app.get('/api/blog/slug/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    if (isMongoActive()) {
+      const post = await BlogModel.findOne({ slug: slug.toLowerCase(), status: 'PUBLISHED' }).lean();
+      if (post) return res.json(post);
+    }
+    res.status(404).json({ message: 'Blog post not found' });
+  } catch (err) {
+    res.status(500).json({ message: 'Blog post fetch error', error: err.message });
+  }
+});
+
+// SEO, FAQs & Sitemap Endpoints
+app.get('/api/seo/home', async (req, res) => {
+  try {
+    let seoData = null;
+    let faqs = [];
+
+    if (isMongoActive()) {
+      seoData = await HomeSEOModel.findOne().lean();
+      faqs = await FaqModel.find({ isActive: true }).sort({ order: 1 }).lean();
+    }
+
+    if (!seoData) {
+      seoData = {
+        seoTitle: 'TechCore | Leading Computer & Tech Retailer in Bangladesh',
+        seoDescription: 'Shop latest laptops, desktop PCs, graphics cards, processors & tech gadgets at best prices in Bangladesh with official warranty.',
+        seoKeywords: ['TechCore', 'Star Tech style', 'PC Builder', 'Laptop Price in BD', 'Graphics Card BD'],
+        ogImage: 'https://images.unsplash.com/photo-1587202372775-e229f172b9d7?w=1200',
+        headingTitle: 'Leading Tech & PC Component Store in Bangladesh',
+        contentBlockHtml: '<p>TechCore provides authentic computer hardware, laptop sales, custom desktop PC build services, official warranty support, and fast delivery all over Bangladesh.</p>'
+      };
+    }
+
+    if (!faqs || faqs.length === 0) {
+      faqs = [
+        { id: 'faq-1', question: 'Does TechCore deliver products outside Dhaka?', answer: 'Yes! We ship across all 64 districts in Bangladesh via Courier with Cash on Delivery.' },
+        { id: 'faq-2', question: 'How can I claim product warranty at TechCore?', answer: 'You can check your warranty online via serial number or submit a claim directly through our Warranty Portal.' },
+        { id: 'faq-3', question: 'Is EMI available for online credit card purchases?', answer: 'Yes, EMI is available for up to 12 months with selected major Bangladeshi bank credit cards.' }
+      ];
+    }
+
+    res.json({ seo: seoData, faqs });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch homepage SEO data', error: err.message });
+  }
+});
+
+app.put('/api/admin/seo/home', requireApprovedAdmin, async (req, res) => {
+  try {
+    const body = req.body;
+    if (isMongoActive()) {
+      const updated = await HomeSEOModel.findOneAndUpdate({}, body, { new: true, upsert: true }).lean();
+      return res.json({ message: 'Homepage SEO data updated successfully', seo: updated });
+    }
+    res.json({ message: 'SEO data saved (RAM mode)', seo: body });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to update SEO data', error: err.message });
+  }
+});
+
+app.get('/api/faqs', async (req, res) => {
+  try {
+    if (isMongoActive()) {
+      const faqs = await FaqModel.find({ isActive: true }).sort({ order: 1 }).lean();
+      if (faqs && faqs.length > 0) return res.json(faqs);
+    }
+    res.json([
+      { id: 'faq-1', question: 'Does TechCore deliver products outside Dhaka?', answer: 'Yes! We ship across all 64 districts in Bangladesh via Courier with Cash on Delivery.' },
+      { id: 'faq-2', question: 'How can I claim product warranty at TechCore?', answer: 'You can check your warranty online via serial number or submit a claim directly through our Warranty Portal.' },
+      { id: 'faq-3', question: 'Is EMI available for online credit card purchases?', answer: 'Yes, EMI is available for up to 12 months with selected major Bangladeshi bank credit cards.' }
+    ]);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch FAQs', error: err.message });
+  }
+});
+
+app.get('/api/sitemap-data', async (req, res) => {
+  try {
+    let productsList = [];
+    let categoriesList = [];
+    let brandsList = [];
+    let blogList = [];
+
+    if (isMongoActive()) {
+      productsList = await ProductModel.find().select('slug updatedAt').lean();
+      categoriesList = await CategoryModel.find({ isActive: true }).select('slug updatedAt').lean();
+      brandsList = await BrandModel.find().select('slug updatedAt').lean();
+      blogList = await BlogModel.find({ status: 'PUBLISHED' }).select('slug updatedAt').lean();
+    } else {
+      productsList = productsStore.map(p => ({ slug: p.slug || slugify(p.name), updatedAt: new Date() }));
+      categoriesList = categories.map(c => ({ slug: c.slug, updatedAt: new Date() }));
+      brandsList = brands.map(b => ({ slug: slugify(b), updatedAt: new Date() }));
+    }
+
+    res.json({
+      baseUrl: process.env.CLIENT_URL || 'https://techcore-store.vercel.app',
+      products: productsList,
+      categories: categoriesList,
+      brands: brandsList,
+      blogs: blogList,
+      staticPages: [
+        { slug: 'about', updatedAt: new Date() },
+        { slug: 'contact', updatedAt: new Date() },
+        { slug: 'privacy-policy', updatedAt: new Date() },
+        { slug: 'terms-and-conditions', updatedAt: new Date() },
+        { slug: 'refund-policy', updatedAt: new Date() },
+        { slug: 'emi', updatedAt: new Date() },
+        { slug: 'outlets', updatedAt: new Date() }
+      ]
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Sitemap data generation error', error: err.message });
+  }
+});
+
+app.get('/api/redirects/:slug', async (req, res) => {
+  try {
+    const { slug } = req.params;
+    if (isMongoActive()) {
+      const redirect = await SlugRedirectModel.findOne({ oldSlug: slug.toLowerCase() }).lean();
+      if (redirect) {
+        return res.json({ redirect: true, statusCode: 301, targetUrl: redirect.targetUrl, newSlug: redirect.newSlug });
+      }
+    }
+    res.json({ redirect: false });
+  } catch (err) {
+    res.status(500).json({ message: 'Redirect check error', error: err.message });
+  }
 });
 
 // -------------------------------------------------------------
