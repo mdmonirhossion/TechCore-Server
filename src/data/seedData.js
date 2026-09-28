@@ -494,6 +494,7 @@ const rawProducts = [
     reviewsCount: 25,
     isFlashSale: false,
     tags: ['Deepcool', 'AK620', 'CPU Cooler']
+  }
 ];
 
 export const products = rawProducts.map(p => ({

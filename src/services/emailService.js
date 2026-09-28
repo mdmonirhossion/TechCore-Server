@@ -162,3 +162,70 @@ export async function sendAdminOrderNotificationEmail({ order }) {
     console.error('❌ Nodemailer Error (Admin Notification):', err.message);
   }
 }
+
+/**
+ * Sends Password Reset OTP code email to user
+ * @param {Object} param0 - { email, otp }
+ */
+export async function sendPasswordResetEmail({ email, otp }) {
+  const senderEmail = process.env.EMAIL_USER || 'mdmonirhossion2002@gmail.com';
+
+  const mailOptions = {
+    from: `"TechCore Security" <${senderEmail}>`,
+    to: email,
+    subject: `🔑 ${otp} is your TechCore Password Reset OTP`,
+    html: `
+      <div style="font-family: Arial, sans-serif; background-color: #0b0f17; color: #ffffff; padding: 25px; border-radius: 12px; max-width: 500px; margin: 0 auto; border: 1px solid #1e293b;">
+        <h2 style="color: #00f2fe; margin-top: 0;">Password Reset Verification Code</h2>
+        <p style="color: #cbd5e1; font-size: 14px;">Use the following 6-digit One-Time Password (OTP) to reset your TechCore account password. This code will expire in 15 minutes.</p>
+        <div style="background-color: #151c28; text-align: center; padding: 15px; border-radius: 8px; font-size: 28px; font-weight: bold; letter-spacing: 6px; color: #00f2fe; border: 1px solid #1e293b; margin: 20px 0;">
+          ${otp}
+        </div>
+        <p style="color: #94a3b8; font-size: 12px;">If you did not request a password reset, please ignore this email or contact support immediately.</p>
+      </div>
+    `
+  };
+
+  try {
+    const info = await getTransporter().sendMail(mailOptions);
+    console.log(`🔑 Password reset OTP email sent to ${email}`);
+    return info;
+  } catch (err) {
+    console.error('❌ Password Reset Email Error:', err.message);
+  }
+}
+
+/**
+ * Sends Contact Us form submission notification to Admin
+ * @param {Object} param0 - { name, email, phone, subject, message }
+ */
+export async function sendContactFormNotificationEmail({ name, email, phone, subject, message }) {
+  const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER || 'mdmonirhossion2002@gmail.com';
+  const senderEmail = process.env.EMAIL_USER || 'mdmonirhossion2002@gmail.com';
+
+  const mailOptions = {
+    from: `"TechCore Contact Form" <${senderEmail}>`,
+    to: adminEmail,
+    subject: `📩 New Contact Form Message: ${subject || 'General Inquiry'}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; background-color: #0b0f17; color: #ffffff; padding: 25px; border-radius: 12px; max-width: 600px; margin: 0 auto; border: 1px solid #1e293b;">
+        <h2 style="color: #00f2fe; margin-top: 0;">New Inquiry Received</h2>
+        <p><strong>Name:</strong> ${name}</p>
+        <p><strong>Email:</strong> <a href="mailto:${email}" style="color: #00f2fe;">${email}</a></p>
+        <p><strong>Phone:</strong> ${phone || 'N/A'}</p>
+        <p><strong>Subject:</strong> ${subject || 'N/A'}</p>
+        <div style="background-color: #151c28; padding: 15px; border-radius: 8px; margin-top: 15px; border-left: 4px solid #00f2fe; font-size: 14px; line-height: 1.6;">
+          ${message}
+        </div>
+      </div>
+    `
+  };
+
+  try {
+    const info = await getTransporter().sendMail(mailOptions);
+    console.log(`📩 Contact Form notification email dispatched to ${adminEmail}`);
+    return info;
+  } catch (err) {
+    console.error('❌ Contact Form Email Error:', err.message);
+  }
+}

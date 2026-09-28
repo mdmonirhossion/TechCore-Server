@@ -155,7 +155,7 @@ export async function runCategoryBrandMigration() {
 }
 
 // Allow direct CLI invocation: node src/scripts/migrateCategoriesAndBrands.js
-if (process.argv[1].endsWith('migrateCategoriesAndBrands.js')) {
+if (process.argv[1] && process.argv[1].endsWith('migrateCategoriesAndBrands.js')) {
   connectDB().then(async (connected) => {
     if (connected) {
       await runCategoryBrandMigration();
