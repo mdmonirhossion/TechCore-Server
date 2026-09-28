@@ -9,7 +9,7 @@ const orderItemSchema = new mongoose.Schema({
 }, { _id: false });
 
 const orderSchema = new mongoose.Schema({
-  id: { type: String, required: true, unique: true, index: true },
+  id: { type: String, required: true, unique: true },
   invoiceNo: { type: String, default: function() { return `INV-${Date.now()}`; } },
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
   customer: {

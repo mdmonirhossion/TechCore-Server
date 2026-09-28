@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const outletSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
-  slug: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
   address: { type: String, required: true, trim: true },
   city: { type: String, default: 'Dhaka', trim: true },
   phone: { type: String, required: true, trim: true },

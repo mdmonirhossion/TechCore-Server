@@ -19,7 +19,7 @@ const productSchema = new mongoose.Schema({
   reviewsCount: { type: Number, default: 0 },
   isFlashSale: { type: Boolean, default: false },
   flashSalePrice: { type: Number },
-  slug: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
   stockStatus: {
     type: String,
     enum: ['IN_STOCK', 'OUT_OF_STOCK', 'PRE_ORDER', 'UP_COMING'],

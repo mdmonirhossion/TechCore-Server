@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 
 const buildSchema = new mongoose.Schema({
-  shareId: { type: String, required: true, unique: true, index: true },
+  shareId: { type: String, required: true, unique: true },
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
   title: { type: String, default: 'Custom PC Build' },
   components: { type: mongoose.Schema.Types.Mixed, default: {} },

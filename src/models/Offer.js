@@ -8,7 +8,7 @@ const campaignProductSchema = new mongoose.Schema({
 
 const offerSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true },
-  slug: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
   banner: { type: String, default: '' },
   description: { type: String, default: '' },
   startAt: { type: Date, required: true },

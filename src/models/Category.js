@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const categorySchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
-  slug: { type: String, required: true, unique: true, index: true, lowercase: true, trim: true },
+  slug: { type: String, required: true, unique: true, lowercase: true, trim: true },
   parent: { type: mongoose.Schema.Types.ObjectId, ref: 'Category', default: null },
   level: { type: Number, default: 1, min: 1, max: 4 },
   icon: { type: String, default: '' },

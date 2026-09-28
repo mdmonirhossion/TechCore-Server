@@ -67,6 +67,52 @@ app.use((req, res, next) => {
   next();
 });
 
+// Rate Limiter Memory Store & Middleware
+const rateLimitMap = new Map();
+
+const createRateLimiter = ({ windowMs, maxRequests, message }) => {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1';
+    const key = `${req.path}_${ip}`;
+    const now = Date.now();
+
+    const record = rateLimitMap.get(key) || { count: 0, resetTime: now + windowMs };
+
+    if (now > record.resetTime) {
+      record.count = 1;
+      record.resetTime = now + windowMs;
+    } else {
+      record.count += 1;
+    }
+
+    rateLimitMap.set(key, record);
+
+    if (record.count > maxRequests) {
+      const retryAfterSeconds = Math.ceil((record.resetTime - now) / 1000);
+      res.setHeader('Retry-After', retryAfterSeconds);
+      return res.status(429).json({
+        success: false,
+        message: message || 'Too many requests. Please try again later.',
+        retryAfterSeconds
+      });
+    }
+
+    next();
+  };
+};
+
+const authRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  maxRequests: 20,
+  message: 'Too many authentication attempts. Please try again in 15 minutes.'
+});
+
+const orderRateLimiter = createRateLimiter({
+  windowMs: 60 * 60 * 1000,
+  maxRequests: 30,
+  message: 'Order creation rate limit exceeded. Please wait before placing another order.'
+});
+
 // Middleware to ensure DB connection completes before processing any API route (solves Vercel serverless cold-start race conditions)
 app.use(async (req, res, next) => {
   if (process.env.MONGODB_URI && mongoose.connection.readyState !== 1) {
@@ -303,7 +349,7 @@ app.post('/api/upload', async (req, res) => {
 // -------------------------------------------------------------
 
 // Register User or Request Co-Admin status
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authRateLimiter, async (req, res) => {
   try {
     const { name, email, password, role, phone } = req.body;
     if (!name || !email || !password) {
@@ -357,7 +403,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // Login API
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -1677,7 +1723,7 @@ app.post('/api/ai/recommend-pc', async (req, res) => {
 // -------------------------------------------------------------
 // 3. CART & ORDER APIS
 // -------------------------------------------------------------
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', orderRateLimiter, async (req, res) => {
   try {
     const { customer, items, subtotal, discount, deliveryFee, paymentMethod } = req.body;
 
