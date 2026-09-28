@@ -70,17 +70,15 @@ export async function initSSLCommerzPayment({ order, serverBaseUrl }) {
     } else {
       console.warn(`⚠️ SSLCommerz Session Init Response:`, data);
       return {
-        status: 'SUCCESS',
-        gatewayUrl: `${serverBaseUrl}/api/payment/sslcommerz/success?orderId=${order.id}&simulated=true`,
+        status: 'FAILED',
         message: data?.failedreason || 'SSLCommerz session initiated'
       };
     }
   } catch (err) {
     console.error('❌ SSLCommerz Init Error:', err.message);
     return {
-      status: 'SUCCESS',
-      gatewayUrl: `${serverBaseUrl}/api/payment/sslcommerz/success?orderId=${order.id}&simulated=true`,
-      message: 'SSLCommerz sandbox mode active'
+      status: 'FAILED',
+      message: err.message || 'SSLCommerz gateway connection error'
     };
   }
 }

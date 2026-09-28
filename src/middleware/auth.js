@@ -12,8 +12,14 @@ export const verifyToken = async (req, res, next) => {
     }
 
     const token = authHeader.split(' ')[1];
-    const jwtSecret = process.env.JWT_SECRET || 'techcore_super_secret_jwt_key_2026';
-    const decoded = jwt.verify(token, jwtSecret);
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(500).json({ message: 'Server security configuration error: JWT_SECRET missing.' });
+      }
+    }
+    const secret = jwtSecret || 'techcore_dev_fallback_secret_only';
+    const decoded = jwt.verify(token, secret);
 
     let user = null;
     try {
