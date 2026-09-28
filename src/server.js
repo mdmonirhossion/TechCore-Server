@@ -433,6 +433,22 @@ app.patch('/api/admin/reject-admin/:id', requireSuperAdmin, async (req, res) => 
 // -------------------------------------------------------------
 // 1. PRODUCTS & CATALOG APIS
 // -------------------------------------------------------------
+const normalizeProduct = (p) => {
+  if (!p) return p;
+  const stockVal = p.stock !== undefined ? p.stock : (p.currentStock !== undefined ? p.currentStock : 10);
+  const imagesArr = Array.isArray(p.images) && p.images.length > 0 
+    ? p.images 
+    : (p.image ? [p.image] : ['https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?w=600&auto=format&fit=crop']);
+
+  return {
+    ...p,
+    stock: stockVal,
+    currentStock: stockVal,
+    images: imagesArr,
+    image: imagesArr[0]
+  };
+};
+
 app.get('/api/products', async (req, res) => {
   const { category, brand, minPrice, maxPrice, search, sort } = req.query;
 
@@ -491,7 +507,7 @@ app.get('/api/products', async (req, res) => {
 
   res.json({
     total: filtered.length,
-    products: filtered
+    products: filtered.map(normalizeProduct)
   });
 });
 
@@ -540,7 +556,7 @@ app.get('/api/products/search', async (req, res) => {
     ])).slice(0, 4);
 
     res.json({
-      products: matchingProducts,
+      products: matchingProducts.map(normalizeProduct),
       brands: matchingBrands,
       categories: matchingCategories,
       suggestions
@@ -556,19 +572,23 @@ app.get('/api/products/compare', async (req, res) => {
   const ids = (req.query.ids || '').split(',').filter(Boolean);
   if (ids.length === 0) return res.json({ products: [] });
 
+  let matched = [];
   if (isMongoActive()) {
     try {
       const dbMatched = await ProductModel.find({ id: { $in: ids } }).lean();
       if (dbMatched && dbMatched.length > 0) {
-        return res.json({ products: dbMatched });
+        matched = dbMatched;
       }
     } catch (e) {
       console.error('Mongo compare error:', e.message);
     }
   }
 
-  const matched = productsStore.filter(p => ids.includes(p.id));
-  res.json({ products: matched });
+  if (matched.length === 0) {
+    matched = productsStore.filter(p => ids.includes(p.id));
+  }
+
+  res.json({ products: matched.map(normalizeProduct) });
 });
 
 // Product Creation (Protected: Super Admin OR Approved Co-Admin Only)
@@ -583,6 +603,10 @@ app.post(['/api/products', '/api/admin/products'], requireApprovedAdmin, async (
     const discountPriceNum = body.discountPrice !== undefined ? Number(body.discountPrice) : priceNum;
     const catName = body.category || 'General';
     const catSlug = body.categorySlug || catName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    const stockNum = body.stock !== undefined ? Number(body.stock) : (body.currentStock !== undefined ? Number(body.currentStock) : 10);
+    const imagesArr = Array.isArray(body.images) && body.images.length > 0 
+      ? body.images 
+      : (body.image ? [body.image] : ['https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?w=600&auto=format&fit=crop']);
 
     const newProd = {
       id: body.id || `prod-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -594,10 +618,8 @@ app.post(['/api/products', '/api/admin/products'], requireApprovedAdmin, async (
       builderCategory: body.builderCategory || undefined,
       price: priceNum,
       discountPrice: discountPriceNum,
-      stock: body.stock !== undefined ? Number(body.stock) : 10,
-      images: Array.isArray(body.images) && body.images.length > 0 
-        ? body.images 
-        : [body.image || 'https://images.unsplash.com/photo-1591799264318-7e6ef8ddb7ea?w=600&auto=format&fit=crop'],
+      stock: stockNum,
+      images: imagesArr,
       description: body.description || `${body.name} high quality tech product.`,
       specifications: body.specifications || {},
       warranty: body.warranty || '1 Year',
@@ -672,13 +694,13 @@ app.get('/api/products/:id', async (req, res) => {
   if (isMongoConnected) {
     try {
       const dbP = await ProductModel.findOne({ id: req.params.id }).lean();
-      if (dbP) return res.json(dbP);
+      if (dbP) return res.json(normalizeProduct(dbP));
     } catch (e) {}
   }
 
   const product = productsStore.find(p => p.id === req.params.id);
   if (!product) return res.status(404).json({ message: 'Product not found' });
-  res.json(product);
+  res.json(normalizeProduct(product));
 });
 
 app.get('/api/categories', (req, res) => {
@@ -927,7 +949,7 @@ app.post('/api/service', (req, res) => {
 // -------------------------------------------------------------
 // 5. ADMIN & ERP DASHBOARD APIS
 // -------------------------------------------------------------
-app.get('/api/admin/analytics', async (req, res) => {
+app.get('/api/admin/analytics', requireApprovedAdmin, async (req, res) => {
   try {
     let allOrders = [...ordersStore];
     let allProducts = [...productsStore];
@@ -982,7 +1004,7 @@ app.get('/api/admin/analytics', async (req, res) => {
   }
 });
 
-app.get('/api/admin/inventory', async (req, res) => {
+app.get('/api/admin/inventory', requireApprovedAdmin, async (req, res) => {
   try {
     let allProducts = [...productsStore];
     if (isMongoActive()) {
@@ -996,22 +1018,30 @@ app.get('/api/admin/inventory', async (req, res) => {
       }
     }
 
-    const inventory = allProducts.map(p => ({
-      id: p.id,
-      sku: p.sku || 'N/A',
-      name: p.name,
-      brand: p.brand,
-      category: p.category,
-      price: p.price,
-      discountPrice: p.discountPrice !== undefined ? p.discountPrice : p.price,
-      image: (Array.isArray(p.images) && p.images.length > 0) ? p.images[0] : (p.image || 'https://images.unsplash.com/photo-1587202372775-e229f172b9d7?w=600&auto=format&fit=crop'),
-      warranty: p.warranty || '3 Years Warranty',
-      currentStock: p.stock !== undefined ? p.stock : (p.currentStock || 0),
-      soldCount: Math.floor(Math.random() * 40) + 10,
-      reservedCount: Math.floor(Math.random() * 5),
-      damagedCount: 1,
-      status: (p.stock !== undefined ? p.stock : (p.currentStock || 0)) <= 0 ? 'OUT_OF_STOCK' : ((p.stock !== undefined ? p.stock : (p.currentStock || 0)) <= 5 ? 'LOW_STOCK' : 'IN_STOCK')
-    }));
+    const inventory = allProducts.map(p => {
+      const stockVal = p.stock !== undefined ? p.stock : (p.currentStock !== undefined ? p.currentStock : 0);
+      const imgVal = (Array.isArray(p.images) && p.images.length > 0) ? p.images[0] : (p.image || 'https://images.unsplash.com/photo-1587202372775-e229f172b9d7?w=600&auto=format&fit=crop');
+      const imgsArr = Array.isArray(p.images) && p.images.length > 0 ? p.images : [imgVal];
+
+      return {
+        id: p.id,
+        sku: p.sku || 'N/A',
+        name: p.name,
+        brand: p.brand || 'Generic',
+        category: p.category || 'General',
+        price: p.price !== undefined ? p.price : (p.discountPrice || 0),
+        discountPrice: p.discountPrice !== undefined ? p.discountPrice : (p.price || 0),
+        image: imgVal,
+        images: imgsArr,
+        warranty: p.warranty || '3 Years Warranty',
+        stock: stockVal,
+        currentStock: stockVal,
+        soldCount: p.soldCount !== undefined ? p.soldCount : Math.floor(Math.random() * 40) + 10,
+        reservedCount: p.reservedCount !== undefined ? p.reservedCount : Math.floor(Math.random() * 5),
+        damagedCount: p.damagedCount !== undefined ? p.damagedCount : 1,
+        status: stockVal <= 0 ? 'OUT_OF_STOCK' : (stockVal <= 5 ? 'LOW_STOCK' : 'IN_STOCK')
+      };
+    });
 
     res.json(inventory);
   } catch (err) {
@@ -1020,7 +1050,7 @@ app.get('/api/admin/inventory', async (req, res) => {
   }
 });
 
-app.patch('/api/admin/inventory/:id', async (req, res) => {
+app.patch('/api/admin/inventory/:id', requireApprovedAdmin, async (req, res) => {
   try {
     const { newStock } = req.body;
     const stockNum = Number(newStock);
@@ -1039,7 +1069,7 @@ app.patch('/api/admin/inventory/:id', async (req, res) => {
           // Sync with in-memory store
           const idx = productsStore.findIndex(p => p.id === req.params.id);
           if (idx !== -1) productsStore[idx].stock = stockNum;
-          return res.json({ message: 'Stock updated successfully in MongoDB', product: updated });
+          return res.json({ message: 'Stock updated successfully in MongoDB', product: normalizeProduct(updated) });
         }
       } catch (e) {
         console.error('Mongo inventory update error:', e.message);
@@ -1049,7 +1079,7 @@ app.patch('/api/admin/inventory/:id', async (req, res) => {
     const prod = productsStore.find(p => p.id === req.params.id);
     if (prod) {
       prod.stock = stockNum;
-      return res.json({ message: 'Stock updated', product: prod });
+      return res.json({ message: 'Stock updated', product: normalizeProduct(prod) });
     }
     res.status(404).json({ message: 'Product not found' });
   } catch (err) {
@@ -1058,11 +1088,11 @@ app.patch('/api/admin/inventory/:id', async (req, res) => {
   }
 });
 
-app.get('/api/admin/suppliers', (req, res) => {
+app.get('/api/admin/suppliers', requireApprovedAdmin, (req, res) => {
   res.json(suppliersStore);
 });
 
-app.post('/api/admin/suppliers', (req, res) => {
+app.post('/api/admin/suppliers', requireApprovedAdmin, (req, res) => {
   const newSupplier = { id: `sup-${suppliersStore.length + 1}`, ...req.body };
   suppliersStore.push(newSupplier);
   res.status(201).json(newSupplier);
