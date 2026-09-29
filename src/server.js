@@ -232,10 +232,17 @@ connectDB().then(async (connected) => {
     // Seed initial products to MongoDB Atlas if database is empty
     try {
       const count = await ProductModel.countDocuments();
-      if (count === 0) {
-        console.log('🌱 Seeding products to MongoDB Atlas collection...');
-        await ProductModel.insertMany(initialProducts);
-        console.log('✅ 18 Products successfully seeded to MongoDB Atlas!');
+      if (count < initialProducts.length) {
+        console.log('🌱 Syncing expanded product catalog to MongoDB Atlas collection...');
+        for (const prod of initialProducts) {
+          await ProductModel.findOneAndUpdate(
+            { slug: prod.slug },
+            { $set: prod },
+            { upsert: true, new: true }
+          );
+        }
+        const updatedCount = await ProductModel.countDocuments();
+        console.log(`✅ Products successfully synced to MongoDB Atlas! Total: ${updatedCount}`);
       } else {
         console.log(`📦 MongoDB Atlas contains ${count} products.`);
       }
