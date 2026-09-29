@@ -551,12 +551,205 @@ app.put('/api/admin/banners/:id', requireApprovedAdmin, async (req, res) => {
   }
 });
 
-app.delete('/api/admin/banners/:id', requireApprovedAdmin, async (req, res) => {
+// Product Data Normalizer Helper
+const normalizeProduct = (p) => {
+  if (!p) return null;
+  const doc = p.toObject ? p.toObject() : p;
+  return {
+    _id: doc._id || doc.id,
+    id: doc.id || (doc._id ? doc._id.toString() : ''),
+    name: doc.name || '',
+    sku: doc.sku || '',
+    brand: doc.brand || 'Generic',
+    category: doc.category || 'General',
+    categorySlug: doc.categorySlug || (doc.category ? doc.category.toLowerCase().replace(/\s+/g, '-') : 'general'),
+    builderCategory: doc.builderCategory || doc.category,
+    price: Number(doc.price) || 0,
+    discountPrice: doc.discountPrice !== undefined ? Number(doc.discountPrice) : (Number(doc.price) || 0),
+    stock: doc.stock !== undefined ? Number(doc.stock) : 10,
+    images: Array.isArray(doc.images) && doc.images.length > 0 ? doc.images : ['https://images.unsplash.com/photo-1587202372775-e229f172b9d7?w=600'],
+    description: doc.description || '',
+    specifications: doc.specifications || {},
+    warranty: doc.warranty || '3 Years Warranty',
+    rating: Number(doc.rating) || 5.0,
+    reviewsCount: Number(doc.reviewsCount) || 0,
+    isFlashSale: Boolean(doc.isFlashSale),
+    flashSalePrice: doc.flashSalePrice ? Number(doc.flashSalePrice) : Number(doc.discountPrice || doc.price || 0),
+    slug: doc.slug || (doc.name ? doc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : 'product'),
+    stockStatus: doc.stockStatus || (Number(doc.stock) > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK'),
+    emiAvailable: doc.emiAvailable !== undefined ? Boolean(doc.emiAvailable) : true,
+    isFeatured: Boolean(doc.isFeatured),
+    badge: doc.badge || '',
+    keyFeatures: Array.isArray(doc.keyFeatures) ? doc.keyFeatures : [],
+    tags: Array.isArray(doc.tags) ? doc.tags : [],
+    createdAt: doc.createdAt || new Date().toISOString()
+  };
+};
+
+// -------------------------------------------------------------
+// PRODUCTS CATALOG & SEARCH APIS
+// -------------------------------------------------------------
+app.get('/api/products', async (req, res) => {
   try {
-    await BannerModel.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Banner deleted' });
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.max(1, parseInt(req.query.limit, 10) || 20);
+    const skip = (page - 1) * limit;
+
+    const { category, brand, search, minPrice, maxPrice, inStock, emi, sort, isFlashSale, isFeatured } = req.query;
+
+    const mongoQuery = {};
+
+    if (category) {
+      const catLower = category.toLowerCase().trim();
+      mongoQuery.$or = [
+        { categorySlug: catLower },
+        { category: new RegExp(`^${category}$`, 'i') }
+      ];
+    }
+
+    if (brand) {
+      mongoQuery.brand = new RegExp(`^${brand}$`, 'i');
+    }
+
+    if (search) {
+      const searchRegex = new RegExp(search.trim(), 'i');
+      const searchConditions = [
+        { name: searchRegex },
+        { brand: searchRegex },
+        { category: searchRegex },
+        { tags: searchRegex },
+        { sku: searchRegex }
+      ];
+      if (mongoQuery.$or) {
+        mongoQuery.$and = [
+          { $or: mongoQuery.$or },
+          { $or: searchConditions }
+        ];
+        delete mongoQuery.$or;
+      } else {
+        mongoQuery.$or = searchConditions;
+      }
+    }
+
+    if (minPrice || maxPrice) {
+      mongoQuery.price = {};
+      if (minPrice) mongoQuery.price.$gte = Number(minPrice);
+      if (maxPrice) mongoQuery.price.$lte = Number(maxPrice);
+    }
+
+    if (inStock === 'true') {
+      mongoQuery.$or = [
+        { stock: { $gt: 0 } },
+        { stockStatus: 'IN_STOCK' }
+      ];
+    }
+
+    if (emi === 'true') {
+      mongoQuery.emiAvailable = true;
+    }
+
+    if (isFlashSale === 'true') {
+      mongoQuery.isFlashSale = true;
+    }
+
+    if (isFeatured === 'true') {
+      mongoQuery.isFeatured = true;
+    }
+
+    let sortOptions = { createdAt: -1 };
+    if (sort === 'price_asc') sortOptions = { price: 1 };
+    else if (sort === 'price_desc') sortOptions = { price: -1 };
+    else if (sort === 'rating') sortOptions = { rating: -1 };
+    else if (sort === 'newest') sortOptions = { createdAt: -1 };
+
+    let totalProducts = 0;
+    let rawProducts = [];
+
+    if (isMongoActive()) {
+      totalProducts = await ProductModel.countDocuments(mongoQuery);
+      rawProducts = await ProductModel.find(mongoQuery)
+        .sort(sortOptions)
+        .skip(skip)
+        .limit(limit)
+        .lean();
+    }
+
+    // In-memory fallback if MongoDB is empty or disconnected
+    if (rawProducts.length === 0 && !isMongoActive()) {
+      let filtered = [...productsStore];
+      if (category) filtered = filtered.filter(p => (p.categorySlug === category.toLowerCase() || p.category.toLowerCase() === category.toLowerCase()));
+      if (brand) filtered = filtered.filter(p => p.brand.toLowerCase() === brand.toLowerCase());
+      if (search) filtered = filtered.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+
+      totalProducts = filtered.length;
+      rawProducts = filtered.slice(skip, skip + limit);
+    }
+
+    const products = rawProducts.map(normalizeProduct);
+
+    res.json({
+      success: true,
+      count: products.length,
+      totalProducts,
+      currentPage: page,
+      totalPages: Math.ceil(totalProducts / limit) || 1,
+      products
+    });
   } catch (err) {
-    res.status(500).json({ message: 'Banner deletion failed', error: err.message });
+    console.error('Fetch products error:', err);
+    res.status(500).json({ success: false, message: 'Failed to fetch products', error: err.message });
+  }
+});
+
+app.get('/api/products/slug/:slug', async (req, res) => {
+  try {
+    const slug = req.params.slug.toLowerCase().trim();
+    let product = null;
+
+    if (isMongoActive()) {
+      product = await ProductModel.findOne({ slug }).lean();
+    }
+
+    if (!product) {
+      product = productsStore.find(p => p.slug === slug);
+    }
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    res.json({ success: true, product: normalizeProduct(product) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Fetch product by slug error', error: err.message });
+  }
+});
+
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    let product = null;
+
+    if (isMongoActive()) {
+      product = await ProductModel.findOne({
+        $or: [
+          { id },
+          { slug: id.toLowerCase() },
+          ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }] : [])
+        ]
+      }).lean();
+    }
+
+    if (!product) {
+      product = productsStore.find(p => p.id === id || p.slug === id.toLowerCase());
+    }
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    res.json({ success: true, product: normalizeProduct(product) });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Fetch product by ID error', error: err.message });
   }
 });
 
