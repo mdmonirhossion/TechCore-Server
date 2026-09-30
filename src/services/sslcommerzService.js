@@ -25,16 +25,20 @@ export async function initSSLCommerzPayment({ order, serverBaseUrl }) {
   const { storeId, storePassword, baseUrl } = getSSLCommerzCredentials();
   const apiEndpoint = `${baseUrl}/gwprocess/v4/api.php`;
 
+  // Always prefer SERVER_URL environment variable for callback URLs
+  const callbackBase = process.env.SERVER_URL || serverBaseUrl || 'http://localhost:5000';
+  const serverUrl = callbackBase.replace(/\/+$/, '');
+
   const payload = new URLSearchParams({
     store_id: storeId,
     store_passwd: storePassword,
     total_amount: order.grandTotal,
     currency: 'BDT',
     tran_id: order.id,
-    success_url: `${serverBaseUrl}/api/payment/sslcommerz/success?orderId=${order.id}`,
-    fail_url: `${serverBaseUrl}/api/payment/sslcommerz/fail?orderId=${order.id}`,
-    cancel_url: `${serverBaseUrl}/api/payment/sslcommerz/cancel?orderId=${order.id}`,
-    ipn_url: `${serverBaseUrl}/api/payment/sslcommerz/ipn`,
+    success_url: `${serverUrl}/api/payment/sslcommerz/success?orderId=${order.id}`,
+    fail_url: `${serverUrl}/api/payment/sslcommerz/fail?orderId=${order.id}`,
+    cancel_url: `${serverUrl}/api/payment/sslcommerz/cancel?orderId=${order.id}`,
+    ipn_url: `${serverUrl}/api/payment/sslcommerz/ipn`,
     shipping_method: 'COURIER',
     product_name: (order.items || []).map(i => i.name).join(', ').substring(0, 100) || 'TechCore Computer Parts',
     product_category: 'Computer & Hardware',
@@ -53,7 +57,7 @@ export async function initSSLCommerzPayment({ order, serverBaseUrl }) {
     ship_country: 'Bangladesh'
   });
 
-  console.log(`💳 Initiating SSLCommerz session for Order #${order.id} (৳${order.grandTotal} BDT)...`);
+  console.log(`Initiating SSLCommerz session for Order #${order.id} (${order.grandTotal} BDT)...`);
 
   try {
     const res = await fetch(apiEndpoint, {
@@ -65,21 +69,21 @@ export async function initSSLCommerzPayment({ order, serverBaseUrl }) {
     const data = await res.json();
 
     if (data && data.status === 'SUCCESS') {
-      console.log(`✅ SSLCommerz session created! Gateway URL: ${data.GatewayPageURL}`);
+      console.log(`SSLCommerz session created! Gateway URL: ${data.GatewayPageURL}`);
       return {
         status: 'SUCCESS',
         gatewayUrl: data.GatewayPageURL,
         sessionkey: data.sessionkey
       };
     } else {
-      console.warn(`⚠️ SSLCommerz Session Init Response:`, data);
+      console.warn(`SSLCommerz Session Init Failed:`, data);
       return {
         status: 'FAILED',
-        message: data?.failedreason || 'SSLCommerz session initiated'
+        message: data?.failedreason || 'SSLCommerz session initiation failed'
       };
     }
   } catch (err) {
-    console.error('❌ SSLCommerz Init Error:', err.message);
+    console.error('SSLCommerz Init Error:', err.message);
     return {
       status: 'FAILED',
       message: err.message || 'SSLCommerz gateway connection error'
@@ -99,13 +103,13 @@ export async function validateSSLCommerzTransaction(valId) {
     const res = await fetch(validationEndpoint);
     const data = await res.json();
     if (data && (data.status === 'VALID' || data.status === 'VALIDATED')) {
-      console.log(`✅ SSLCommerz Transaction Validated Successfully: ${valId}`);
+      console.log(`SSLCommerz Transaction Validated Successfully: ${valId}`);
       return { isValid: true, data };
     }
-    console.warn(`⚠️ SSLCommerz Transaction Validation Status:`, data?.status);
+    console.warn(`SSLCommerz Transaction Validation Status:`, data?.status);
     return { isValid: false, data };
   } catch (err) {
-    console.error('❌ SSLCommerz Validation Server Error:', err.message);
+    console.error('SSLCommerz Validation Server Error:', err.message);
     return { isValid: false, error: err.message };
   }
 }

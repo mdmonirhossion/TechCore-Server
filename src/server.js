@@ -1880,149 +1880,327 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
 
 app.all('/api/payment/sslcommerz/success', async (req, res) => {
   try {
-    const { orderId, val_id, tran_id } = { ...req.query, ...req.body };
+    const { orderId, val_id, tran_id, amount, currency } = { ...req.query, ...req.body };
     const targetId = orderId || tran_id;
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
-    if (!val_id) {
-      console.warn(`⚠️ SSLCommerz Success hit without val_id for Order #${targetId}`);
-      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=missing_val_id`);
-    }
-
-    const valResult = await validateSSLCommerzTransaction(val_id);
-    if (!valResult.isValid) {
-      console.warn(`⚠️ SSLCommerz Validation Failed for val_id ${val_id}`);
-      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=validation_failed`);
+    if (!targetId) {
+      return res.redirect(`${clientUrl}/checkout/fail?reason=missing_order_id`);
     }
 
     let order = null;
-    if (isMongoActive() && targetId) {
+    if (isMongoActive()) {
       order = await OrderModel.findOne({ id: targetId });
     } else {
       order = ordersStore.find(o => o.id === targetId);
     }
 
     if (!order) {
-      console.warn(`⚠️ SSLCommerz Success: Order #${targetId} not found in DB`);
+      console.warn(`SSLCommerz Success: Order #${targetId} not found in DB`);
       return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=order_not_found`);
     }
 
-    // Security check: verify amount & tran_id match to prevent fake/tampered payments
-    const paidAmount = Number(valResult.data?.amount || valResult.data?.currency_amount);
-    const expectedAmount = Number(order.grandTotal);
-    const returnedTranId = valResult.data?.tran_id;
+    // IDEMPOTENCY CHECK: Do nothing if already Paid
+    if (order.paymentStatus === 'Paid') {
+      return res.redirect(`${clientUrl}/checkout/success?orderId=${order.id}`);
+    }
 
-    if (returnedTranId && returnedTranId !== targetId && returnedTranId !== order.id) {
-      console.warn(`⚠️ SSLCommerz Security Violation: tran_id mismatch. Expected ${order.id}, got ${returnedTranId}`);
-      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=transaction_mismatch`);
+    if (!val_id) {
+      console.warn(`SSLCommerz Success hit without val_id for Order #${targetId}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=missing_val_id`);
+    }
+
+    // Validate via val_id with SSLCommerz Validation Server
+    const valResult = await validateSSLCommerzTransaction(val_id);
+    if (!valResult.isValid) {
+      console.warn(`SSLCommerz Validation Failed for val_id ${val_id}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=validation_failed`);
+    }
+
+    const valData = valResult.data || {};
+    const paidAmount = Number(valData.amount || valData.currency_amount || amount);
+    const paidCurrency = String(valData.currency || valData.currency_type || currency || 'BDT').toUpperCase();
+    const paidTranId = String(valData.tran_id || tran_id || targetId).trim();
+    const expectedAmount = Number(order.grandTotal);
+
+    // Strict Verification: check amount == order.grandTotal, currency == 'BDT', tran_id == order.id
+    if (paidTranId !== order.id) {
+      console.warn(`SSLCommerz Security Violation: tran_id mismatch. Expected ${order.id}, got ${paidTranId}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${order.id}&reason=transaction_mismatch`);
+    }
+
+    if (paidCurrency !== 'BDT') {
+      console.warn(`SSLCommerz Security Violation: Currency mismatch. Expected BDT, got ${paidCurrency}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${order.id}&reason=currency_mismatch`);
     }
 
     if (isNaN(paidAmount) || Math.abs(paidAmount - expectedAmount) > 0.01) {
-      console.warn(`⚠️ SSLCommerz Security Violation: Amount mismatch for Order #${targetId}. Expected ${expectedAmount}, got ${paidAmount}`);
-      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=amount_mismatch`);
+      console.warn(`SSLCommerz Security Violation: Amount mismatch. Expected ${expectedAmount}, got ${paidAmount}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${order.id}&reason=amount_mismatch`);
     }
+
+    // On Success: Set Paid + CONFIRMED and save paymentDetails
+    const paymentDetails = {
+      valId: val_id,
+      tranId: paidTranId,
+      cardType: valData.card_type || req.query.card_type || req.body.card_type || 'N/A',
+      storeAmount: valData.store_amount || req.query.store_amount || req.body.store_amount,
+      bankTranId: valData.bank_tran_id || req.query.bank_tran_id || req.body.bank_tran_id,
+      cardIssuer: valData.card_issuer || 'N/A',
+      cardBrand: valData.card_brand || 'N/A'
+    };
 
     if (isMongoActive()) {
       order.paymentStatus = 'Paid';
       order.orderStatus = 'CONFIRMED';
-      order.paymentDetails = {
-        valId: val_id,
-        tranId: tran_id,
-        cardType: req.query.card_type || req.body.card_type,
-        storeAmount: req.query.store_amount || req.body.store_amount,
-        bankTranId: req.query.bank_tran_id || req.body.bank_tran_id
-      };
+      order.paymentDetails = paymentDetails;
       if (!order.statusHistory) order.statusHistory = [];
       order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz' });
       await order.save();
     } else {
       order.paymentStatus = 'Paid';
       order.orderStatus = 'CONFIRMED';
+      order.paymentDetails = paymentDetails;
     }
 
-    // Send order confirmation emails now that online payment is verified
+    // Send confirmation emails
     if (order.customer?.email) {
-      sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('Online order confirmation email error:', e.message));
+      sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('Online confirmation email error:', e.message));
     }
-    sendAdminOrderNotificationEmail(order).catch(e => console.error('Online admin notification email error:', e.message));
+    sendAdminOrderNotificationEmail(order).catch(e => console.error('Online admin notification error:', e.message));
 
-    res.redirect(`${clientUrl}/checkout/success?orderId=${targetId}`);
+    return res.redirect(`${clientUrl}/checkout/success?orderId=${order.id}`);
   } catch (err) {
     console.error('SSLCommerz success handler error:', err.message);
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-    res.redirect(`${clientUrl}/checkout/fail?reason=server_error`);
+    return res.redirect(`${clientUrl}/checkout/fail?reason=server_error`);
   }
 });
 
 app.all('/api/payment/sslcommerz/fail', async (req, res) => {
-  const { orderId, tran_id } = { ...req.query, ...req.body };
-  const targetId = orderId || tran_id;
+  try {
+    const { orderId, tran_id } = { ...req.query, ...req.body };
+    const targetId = orderId || tran_id;
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
-  if (isMongoActive() && targetId) {
-    await OrderModel.findOneAndUpdate({ id: targetId }, { paymentStatus: 'Failed' });
+    if (targetId) {
+      let order = null;
+      if (isMongoActive()) {
+        order = await OrderModel.findOne({ id: targetId });
+      } else {
+        order = ordersStore.find(o => o.id === targetId);
+      }
+
+      if (order && order.paymentStatus !== 'Paid') {
+        if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
+          order.paymentStatus = 'Failed';
+          order.orderStatus = 'CANCELLED';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'FAILED', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz' });
+          if (isMongoActive()) await order.save();
+
+          // Restore stock
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              if (isMongoActive()) {
+                await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
+              } else {
+                const p = productsStore.find(x => x.id === pId);
+                if (p) p.stock += qty;
+              }
+            }
+          }
+        }
+      }
+    }
+    res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId || ''}`);
+  } catch (err) {
+    console.error('SSLCommerz fail handler error:', err.message);
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    res.redirect(`${clientUrl}/checkout/fail`);
   }
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-  res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}`);
 });
 
 app.all('/api/payment/sslcommerz/cancel', async (req, res) => {
-  const { orderId, tran_id } = { ...req.query, ...req.body };
-  const targetId = orderId || tran_id;
+  try {
+    const { orderId, tran_id } = { ...req.query, ...req.body };
+    const targetId = orderId || tran_id;
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-  res.redirect(`${clientUrl}/cart?cancelledOrder=${targetId}`);
+    if (targetId) {
+      let order = null;
+      if (isMongoActive()) {
+        order = await OrderModel.findOne({ id: targetId });
+      } else {
+        order = ordersStore.find(o => o.id === targetId);
+      }
+
+      if (order && order.paymentStatus !== 'Paid') {
+        if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
+          order.paymentStatus = 'Failed';
+          order.orderStatus = 'CANCELLED';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'CANCELLED', time: new Date().toLocaleString(), note: 'Payment cancelled by user' });
+          if (isMongoActive()) await order.save();
+
+          // Restore stock
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              if (isMongoActive()) {
+                await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
+              } else {
+                const p = productsStore.find(x => x.id === pId);
+                if (p) p.stock += qty;
+              }
+            }
+          }
+        }
+      }
+    }
+    res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId || ''}&reason=cancelled`);
+  } catch (err) {
+    console.error('SSLCommerz cancel handler error:', err.message);
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    res.redirect(`${clientUrl}/checkout/fail?reason=cancelled`);
+  }
 });
 
 app.post('/api/payment/sslcommerz/ipn', async (req, res) => {
   try {
-    const { val_id, tran_id, status } = req.body;
-    console.log(`🔔 SSLCommerz IPN Notification received for transaction ${tran_id} (Status: ${status})`);
+    const { val_id, tran_id, status } = { ...req.query, ...req.body };
+    console.log(`SSLCommerz IPN Notification received for transaction ${tran_id} (Status: ${status})`);
 
-    if (status === 'VALID' || status === 'VALIDATED') {
-      if (val_id) {
-        const valRes = await validateSSLCommerzTransaction(val_id);
-        if (valRes.isValid && isMongoActive()) {
-          await OrderModel.findOneAndUpdate(
-            { id: tran_id },
-            { paymentStatus: 'Paid', orderStatus: 'CONFIRMED' }
-          );
+    if (!tran_id) return res.status(400).send('IPN missing tran_id');
+
+    let order = null;
+    if (isMongoActive()) {
+      order = await OrderModel.findOne({ id: tran_id });
+    } else {
+      order = ordersStore.find(o => o.id === tran_id);
+    }
+
+    if (!order) return res.status(404).send('IPN order not found');
+
+    // IDEMPOTENCY CHECK
+    if (order.paymentStatus === 'Paid') {
+      return res.status(200).send('IPN already processed for Paid order');
+    }
+
+    if ((status === 'VALID' || status === 'VALIDATED') && val_id) {
+      const valRes = await validateSSLCommerzTransaction(val_id);
+      if (valRes.isValid) {
+        const valData = valRes.data || {};
+        const paidAmount = Number(valData.amount || valData.currency_amount);
+        const paidCurrency = String(valData.currency || valData.currency_type || 'BDT').toUpperCase();
+        const paidTranId = String(valData.tran_id || tran_id).trim();
+        const expectedAmount = Number(order.grandTotal);
+
+        if (paidTranId === order.id && paidCurrency === 'BDT' && !isNaN(paidAmount) && Math.abs(paidAmount - expectedAmount) <= 0.01) {
+          const paymentDetails = {
+            valId: val_id,
+            tranId: paidTranId,
+            cardType: valData.card_type || req.body.card_type || 'N/A',
+            storeAmount: valData.store_amount || req.body.store_amount,
+            bankTranId: valData.bank_tran_id || req.body.bank_tran_id,
+            cardIssuer: valData.card_issuer || 'N/A',
+            cardBrand: valData.card_brand || 'N/A'
+          };
+
+          if (isMongoActive()) {
+            order.paymentStatus = 'Paid';
+            order.orderStatus = 'CONFIRMED';
+            order.paymentDetails = paymentDetails;
+            if (!order.statusHistory) order.statusHistory = [];
+            order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz IPN' });
+            await order.save();
+          } else {
+            order.paymentStatus = 'Paid';
+            order.orderStatus = 'CONFIRMED';
+            order.paymentDetails = paymentDetails;
+          }
+
+          if (order.customer?.email) {
+            sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('IPN email error:', e.message));
+          }
+          sendAdminOrderNotificationEmail(order).catch(e => console.error('IPN admin email error:', e.message));
+
+          return res.status(200).send('IPN payment verified and processed');
         }
       }
+    } else if (status === 'FAILED' || status === 'CANCELLED') {
+      if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
+        order.paymentStatus = 'Failed';
+        order.orderStatus = 'CANCELLED';
+        if (!order.statusHistory) order.statusHistory = [];
+        order.statusHistory.push({ status: 'FAILED_IPN', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz IPN' });
+        if (isMongoActive()) await order.save();
+
+        // Restore stock
+        for (const item of (order.items || [])) {
+          const pId = item.productId || item.id;
+          const qty = Number(item.quantity) || 1;
+          if (pId && qty > 0) {
+            if (isMongoActive()) {
+              await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
+            } else {
+              const p = productsStore.find(x => x.id === pId);
+              if (p) p.stock += qty;
+            }
+          }
+        }
+      }
+      return res.status(200).send('IPN failure processed');
     }
-    res.status(200).send('IPN received');
+
+    return res.status(400).send('IPN validation criteria not met');
   } catch (err) {
+    console.error('IPN Error:', err.message);
     res.status(500).send('IPN Error');
   }
 });
 
-// Order Tracking API
+// Public Order Tracking & Status API
 app.get('/api/orders/track', async (req, res) => {
   try {
-    const { orderId, phone } = req.query;
-    if (!orderId && !phone) {
+    const { orderId, query, phone } = req.query;
+    const searchId = (orderId || query || '').trim();
+    const searchPhone = (phone || '').trim();
+
+    if (!searchId && !searchPhone) {
       return res.status(400).json({ message: 'Order ID or phone number is required.' });
     }
 
     let order = null;
     if (isMongoActive()) {
-      const query = {};
-      if (orderId) query.id = orderId.trim();
-      else if (phone) query['customer.phone'] = phone.trim();
-      order = await OrderModel.findOne(query).sort({ createdAt: -1 }).lean();
+      const dbQuery = {};
+      if (searchId) {
+        dbQuery.$or = [{ id: searchId }, { invoiceNo: searchId }];
+      } else if (searchPhone) {
+        dbQuery['customer.phone'] = searchPhone;
+      }
+      order = await OrderModel.findOne(dbQuery).sort({ createdAt: -1 }).lean();
     }
 
     if (!order) {
-      order = ordersStore.find(o => (orderId && o.id === orderId) || (phone && o.customer?.phone === phone));
+      order = ordersStore.find(o => 
+        (searchId && (o.id === searchId || o.invoiceNo === searchId)) || 
+        (searchPhone && o.customer?.phone === searchPhone)
+      );
     }
 
     if (!order) {
-      return res.status(404).json({ message: 'No matching order found with provided tracking details.' });
+      return res.status(404).json({ message: 'No matching order found.' });
     }
 
     res.json({
       id: order.id,
       invoiceNo: order.invoiceNo || order.id,
       customerName: order.customer?.name,
+      paymentMethod: order.paymentMethod,
       orderStatus: order.orderStatus,
       paymentStatus: order.paymentStatus,
       grandTotal: order.grandTotal,
