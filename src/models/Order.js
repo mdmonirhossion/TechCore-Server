@@ -14,7 +14,7 @@ const orderSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
   customer: {
     name: { type: String, required: true, trim: true },
-    email: { type: String, required: true, lowercase: true, trim: true },
+    email: { type: String, required: false, lowercase: true, trim: true },
     phone: { 
       type: String, 
       required: true, 
@@ -37,13 +37,13 @@ const orderSchema = new mongoose.Schema({
   grandTotal: { type: Number, required: true },
   paymentMethod: { 
     type: String, 
-    enum: ['Cash on Delivery', 'SSLCommerz', 'bKash', 'Nagad', 'Stripe'], 
-    default: 'Cash on Delivery' 
+    enum: ['COD', 'SSLCOMMERZ', 'BKASH', 'NAGAD', 'STRIPE', 'Cash on Delivery', 'SSLCommerz', 'bKash', 'Nagad', 'Stripe'], 
+    default: 'COD' 
   },
   paymentStatus: { 
     type: String, 
-    enum: ['Pending', 'Paid', 'Failed', 'Refunded'], 
-    default: 'Pending' 
+    enum: ['Unpaid', 'Paid', 'Failed', 'Pending', 'Refunded'], 
+    default: 'Unpaid' 
   },
   paymentDetails: {
     valId: { type: String },
@@ -54,9 +54,10 @@ const orderSchema = new mongoose.Schema({
   },
   orderStatus: { 
     type: String, 
-    enum: ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED'], 
-    default: 'CONFIRMED' 
+    enum: ['PENDING_PAYMENT', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED'], 
+    default: 'PENDING' 
   },
+  expiresAt: { type: Date },
   courier: { type: String, default: 'Pathao Courier' },
   trackingNumber: { type: String, default: '' },
   statusHistory: [{

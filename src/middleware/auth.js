@@ -14,12 +14,9 @@ export const verifyToken = async (req, res, next) => {
     const token = authHeader.split(' ')[1];
     const jwtSecret = process.env.JWT_SECRET;
     if (!jwtSecret) {
-      if (process.env.NODE_ENV === 'production') {
-        return res.status(500).json({ message: 'Server security configuration error: JWT_SECRET missing.' });
-      }
+      return res.status(500).json({ message: 'Server security configuration error: JWT_SECRET missing.' });
     }
-    const secret = jwtSecret || 'techcore_dev_fallback_secret_only';
-    const decoded = jwt.verify(token, secret);
+    const decoded = jwt.verify(token, jwtSecret);
 
     let user = null;
     try {
@@ -31,24 +28,7 @@ export const verifyToken = async (req, res, next) => {
     }
 
     if (!user) {
-      if (decoded.role === 'SUPER_ADMIN' || decoded.email === 'techcoreadmin@gmail.com') {
-        user = {
-          _id: decoded.id || 'super_admin_id',
-          name: 'TechCore Main Admin',
-          email: decoded.email || 'techcoreadmin@gmail.com',
-          role: 'SUPER_ADMIN',
-          status: 'APPROVED'
-        };
-      } else if (decoded.role) {
-        user = {
-          _id: decoded.id,
-          email: decoded.email,
-          role: decoded.role,
-          status: 'APPROVED'
-        };
-      } else {
-        return res.status(401).json({ message: 'User not found or token invalid.' });
-      }
+      return res.status(401).json({ message: 'User not found or token invalid.' });
     }
 
     req.user = user;
@@ -85,7 +65,7 @@ export const requireApprovedAdmin = async (req, res, next) => {
         });
       } else {
         return res.status(403).json({ 
-          message: 'আপনার পারমিশন মুলতুবি (PENDING) অবস্থায় আছে! মেইন এডমিন (techcoreadmin@gmail.com) এর এপ্রুভালের জন্য অপেক্ষা করুন।' 
+          message: 'আপনার পারমিশন মুলতুবি (PENDING) অবস্থায় আছে! মেইন এডমিন এর এপ্রুভালের জন্য অপেক্ষা করুন।' 
         });
       }
     }

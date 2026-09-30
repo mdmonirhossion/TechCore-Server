@@ -1,4 +1,9 @@
 import 'dotenv/config';
+
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL ERROR: JWT_SECRET environment variable is missing.');
+  throw new Error('JWT_SECRET environment variable is required.');
+}
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
@@ -46,26 +51,26 @@ import { generateInvoicePdfBuffer } from './services/invoiceService.js';
 import { sendOrderConfirmationEmail, sendAdminOrderNotificationEmail, sendPasswordResetEmail } from './services/emailService.js';
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+const clientUrls = process.env.CLIENT_URL
+  ? process.env.CLIENT_URL.split(',').map(url => url.trim()).filter(Boolean)
+  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174'];
 
-// Global Security, CORS & Content Security Policy (CSP) Headers Middleware
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' https://vercel.live; connect-src * 'unsafe-inline' https://vercel.live; img-src * data: blob:; style-src * 'unsafe-inline';"
-  );
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Content-Type', 'application/json');
-    return res.status(200).json({ status: 'ok' });
-  }
-  next();
-});
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || clientUrls.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate Limiter Memory Store & Middleware
 const rateLimitMap = new Map();
@@ -198,20 +203,28 @@ function isMongoActive() {
 
 const seedSuperAdmin = async () => {
   try {
-    const mainEmail = 'techcoreadmin@gmail.com';
-    const existingAdmin = await UserModel.findOne({ email: mainEmail });
+    const mainEmail = process.env.ADMIN_EMAIL;
+    const mainPassword = process.env.ADMIN_PASSWORD;
+
+    if (!mainEmail || !mainPassword) {
+      console.warn('⚠️ ADMIN_EMAIL or ADMIN_PASSWORD environment variable is missing. Super Admin auto-seeding skipped.');
+      return;
+    }
+
+    const normalizedEmail = mainEmail.toLowerCase().trim();
+    const existingAdmin = await UserModel.findOne({ email: normalizedEmail });
     if (!existingAdmin) {
-      console.log('👑 Seeding Main Super Admin account (techcoreadmin@gmail.com)...');
-      const hashedPassword = await bcrypt.hash('admin890@', 10);
+      console.log(`👑 Seeding Main Super Admin account (${normalizedEmail})...`);
+      const hashedPassword = await bcrypt.hash(mainPassword, 10);
       await UserModel.create({
         name: 'TechCore Main Admin',
-        email: mainEmail,
+        email: normalizedEmail,
         password: hashedPassword,
         role: 'SUPER_ADMIN',
         status: 'APPROVED',
         phone: '+8801700000000'
       });
-      console.log('✅ Main Super Admin account created successfully! (techcoreadmin@gmail.com)');
+      console.log(`✅ Main Super Admin account created successfully! (${normalizedEmail})`);
     } else {
       if (existingAdmin.role !== 'SUPER_ADMIN' || existingAdmin.status !== 'APPROVED') {
         existingAdmin.role = 'SUPER_ADMIN';
@@ -364,7 +377,7 @@ app.post('/api/auth/register', authRateLimiter, async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
-    if (normalizedEmail === 'techcoreadmin@gmail.com') {
+    if (process.env.ADMIN_EMAIL && normalizedEmail === process.env.ADMIN_EMAIL.toLowerCase().trim()) {
       return res.status(400).json({ message: 'This email is reserved for the Main Super Admin.' });
     }
 
@@ -386,7 +399,7 @@ app.post('/api/auth/register', authRateLimiter, async (req, res) => {
       phone
     });
 
-    const jwtSecret = (process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? (() => { throw new Error('JWT_SECRET missing'); })() : 'techcore_dev_fallback_secret_only'));
+    const jwtSecret = process.env.JWT_SECRET;
     const token = jwt.sign({ id: newUser._id, role: newUser.role, email: newUser.email }, jwtSecret, { expiresIn: '7d' });
 
     res.status(201).json({
@@ -437,15 +450,13 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     let isMatch = false;
     if (user.password) {
       isMatch = await bcrypt.compare(password, user.password);
-    } else if (user.email === 'techcoreadmin@gmail.com' && password === 'admin890@') {
-      isMatch = true;
     }
 
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid email or password.' });
     }
 
-    const jwtSecret = (process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? (() => { throw new Error('JWT_SECRET missing'); })() : 'techcore_dev_fallback_secret_only'));
+    const jwtSecret = process.env.JWT_SECRET;
     const token = jwt.sign(
       { id: user._id || user.id, role: user.role, email: user.email, name: user.name },
       jwtSecret,
@@ -1766,7 +1777,7 @@ app.post('/api/emi/calculate', (req, res) => {
 app.patch('/api/admin/orders/:id/status', requireApprovedAdmin, async (req, res) => {
   try {
     const { status, courier, trackingNumber, note } = req.body;
-    const validStatuses = ['PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED'];
+    const validStatuses = ['PENDING_PAYMENT', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED'];
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid order status value' });
     }
