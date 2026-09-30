@@ -9,6 +9,7 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
+import crypto from 'crypto';
 
 import { connectDB, getLastMongoError } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
@@ -1628,6 +1629,255 @@ app.post('/api/payment/sslcommerz/init', async (req, res) => {
   }
 });
 
+// -------------------------------------------------------------
+// CREATE ORDER API (POST /api/orders)
+// -------------------------------------------------------------
+app.post('/api/orders', orderRateLimiter, async (req, res) => {
+  let reservedItems = [];
+  try {
+    const { items, customer, paymentMethod, couponCode, district } = req.body;
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'Order items are required.' });
+    }
+
+    if (!customer || !customer.name || !customer.phone || !customer.address) {
+      return res.status(400).json({ message: 'Customer name, phone, and address are required.' });
+    }
+
+    const phoneTrimmed = String(customer.phone).trim();
+    if (!/^01[3-9]\d{8}$/.test(phoneTrimmed)) {
+      return res.status(400).json({ message: 'Invalid 11-digit Bangladeshi mobile number format.' });
+    }
+
+    const method = String(paymentMethod || 'COD').toUpperCase();
+    if (method !== 'COD' && method !== 'SSLCOMMERZ') {
+      return res.status(400).json({ message: 'Invalid payment method. Allowed: COD, SSLCOMMERZ.' });
+    }
+
+    // Optional Auth User Extraction
+    let userId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.split(' ')[1];
+        if (process.env.JWT_SECRET) {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          if (decoded && decoded.id) userId = decoded.id;
+        }
+      } catch (e) {}
+    }
+
+    // 1. Atomically Check & Reserve Stock, fetch real product prices from DB
+    for (const item of items) {
+      const pId = item.productId || item.id;
+      const qty = Math.max(1, Number(item.quantity) || 1);
+      if (!pId) continue;
+
+      let prod = null;
+      if (isMongoActive()) {
+        prod = await ProductModel.findOneAndUpdate(
+          { $or: [{ id: pId }, { slug: pId }], stock: { $gte: qty } },
+          { $inc: { stock: -qty } },
+          { new: true }
+        ).lean();
+      } else {
+        prod = productsStore.find(p => (p.id === pId || p.slug === pId) && p.stock >= qty);
+        if (prod) {
+          prod.stock -= qty;
+        }
+      }
+
+      if (!prod) {
+        // Rollback reserved stock for previous items in this loop
+        for (const r of reservedItems) {
+          if (isMongoActive()) {
+            await ProductModel.findOneAndUpdate({ id: r.productId }, { $inc: { stock: r.quantity } });
+          } else {
+            const p = productsStore.find(x => x.id === r.productId);
+            if (p) p.stock += r.quantity;
+          }
+        }
+        return res.status(400).json({ message: `Product ${pId} is out of stock or unavailable.` });
+      }
+
+      reservedItems.push({
+        productId: prod.id || prod._id,
+        name: prod.name,
+        price: prod.price,
+        quantity: qty,
+        image: Array.isArray(prod.images) ? prod.images[0] : (prod.image || '')
+      });
+    }
+
+    if (reservedItems.length === 0) {
+      return res.status(400).json({ message: 'No valid items found to order.' });
+    }
+
+    // 2. Compute Subtotal
+    const subtotal = reservedItems.reduce((sum, i) => sum + (i.price * i.quantity), 0);
+
+    // 3. Validate Coupon (Server-Side)
+    let couponDiscount = 0;
+    if (couponCode && typeof couponCode === 'string') {
+      const codeUpper = couponCode.trim().toUpperCase();
+      if (isMongoActive()) {
+        const cDoc = await CouponModel.findOne({ code: codeUpper, isActive: true }).lean();
+        if (cDoc && (!cDoc.expiryDate || new Date(cDoc.expiryDate) > new Date())) {
+          if (!cDoc.minOrderAmount || subtotal >= cDoc.minOrderAmount) {
+            if (cDoc.discountType === 'PERCENTAGE') {
+              couponDiscount = Math.round((subtotal * cDoc.discountPercent) / 100);
+              if (cDoc.maxDiscountAmount) couponDiscount = Math.min(couponDiscount, cDoc.maxDiscountAmount);
+            } else {
+              couponDiscount = cDoc.discountAmount || 0;
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Calculate Delivery Fee via Delivery Rules
+    const targetDistrict = customer.district || district || 'Dhaka';
+    const isInsideDhaka = targetDistrict.toLowerCase() === 'dhaka';
+
+    let rule = null;
+    if (isMongoActive()) {
+      rule = await DeliveryRuleModel.findOne().lean();
+    }
+
+    const insideFee = rule ? rule.insideDhakaFee : 60;
+    const outsideFee = rule ? rule.outsideDhakaFee : 120;
+    const freeThreshold = rule ? rule.freeDeliveryThreshold : 10000;
+
+    let baseFee = isInsideDhaka ? insideFee : outsideFee;
+    if (rule && Array.isArray(rule.districtOverrides)) {
+      const override = rule.districtOverrides.find(o => o.district.toLowerCase() === targetDistrict.toLowerCase());
+      if (override) baseFee = override.fee;
+    }
+
+    const deliveryFee = subtotal >= freeThreshold ? 0 : baseFee;
+    const grandTotal = Math.max(0, subtotal - couponDiscount) + deliveryFee;
+
+    // 5. Generate Secure Order ID & Expiration
+    const orderId = 'INV-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+
+    const orderData = {
+      id: orderId,
+      invoiceNo: orderId,
+      user: userId || null,
+      customer: {
+        name: String(customer.name).trim(),
+        email: customer.email ? String(customer.email).trim() : '',
+        phone: phoneTrimmed,
+        address: String(customer.address).trim(),
+        division: customer.division || 'Dhaka',
+        district: targetDistrict,
+        upazila: customer.upazila || 'Dhaka Sadar',
+        city: targetDistrict,
+        zone: isInsideDhaka ? 'Inside Dhaka' : 'Outside Dhaka'
+      },
+      items: reservedItems,
+      subtotal,
+      discount: couponDiscount,
+      couponDiscount,
+      deliveryFee,
+      grandTotal,
+      paymentMethod: method,
+      paymentStatus: 'Unpaid',
+      orderStatus: method === 'SSLCOMMERZ' ? 'PENDING_PAYMENT' : 'PENDING',
+      expiresAt: method === 'SSLCOMMERZ' ? new Date(Date.now() + 30 * 60 * 1000) : null,
+      statusHistory: [{
+        status: method === 'SSLCOMMERZ' ? 'PENDING_PAYMENT' : 'PENDING',
+        time: new Date().toLocaleString(),
+        note: `Order created via ${method}`
+      }]
+    };
+
+    // 6. Save Order in DB FIRST (so tran_id matches order in DB)
+    let savedOrder = null;
+    if (isMongoActive()) {
+      savedOrder = await OrderModel.create(orderData);
+    } else {
+      ordersStore.push(orderData);
+      savedOrder = orderData;
+    }
+
+    // 7. Payment Method Branching
+    if (method === 'COD') {
+      // Async emails for COD (non-blocking)
+      if (customer.email) {
+        sendOrderConfirmationEmail(savedOrder, customer.email).catch(e => console.error('COD confirmation email error:', e.message));
+      }
+      sendAdminOrderNotificationEmail(savedOrder).catch(e => console.error('Admin order notification error:', e.message));
+
+      return res.status(201).json({
+        success: true,
+        order: savedOrder
+      });
+    } else if (method === 'SSLCOMMERZ') {
+      const protocol = req.protocol || 'http';
+      const host = req.get('host') || 'localhost:5000';
+      const serverBaseUrl = `${protocol}://${host}`;
+
+      try {
+        const sslRes = await initSSLCommerzPayment({ order: savedOrder, serverBaseUrl });
+        if (sslRes && sslRes.status === 'SUCCESS' && sslRes.gatewayUrl) {
+          return res.status(201).json({
+            success: true,
+            order: savedOrder,
+            gatewayUrl: sslRes.gatewayUrl
+          });
+        }
+
+        // If SSLCommerz session init returned FAILED, rollback stock and remove order
+        console.warn('⚠️ SSLCommerz Init Failed, rolling back order & stock:', sslRes);
+        for (const r of reservedItems) {
+          if (isMongoActive()) {
+            await ProductModel.findOneAndUpdate({ id: r.productId }, { $inc: { stock: r.quantity } });
+          } else {
+            const p = productsStore.find(x => x.id === r.productId);
+            if (p) p.stock += r.quantity;
+          }
+        }
+        if (isMongoActive()) {
+          await OrderModel.deleteOne({ id: orderId });
+        }
+        return res.status(400).json({
+          success: false,
+          message: sslRes?.message || 'SSLCommerz payment session initiation failed.'
+        });
+      } catch (sslErr) {
+        // Rollback stock and remove order on exception
+        for (const r of reservedItems) {
+          if (isMongoActive()) {
+            await ProductModel.findOneAndUpdate({ id: r.productId }, { $inc: { stock: r.quantity } });
+          } else {
+            const p = productsStore.find(x => x.id === r.productId);
+            if (p) p.stock += r.quantity;
+          }
+        }
+        if (isMongoActive()) {
+          await OrderModel.deleteOne({ id: orderId });
+        }
+        return res.status(500).json({
+          success: false,
+          message: 'SSLCommerz session error: ' + sslErr.message
+        });
+      }
+    }
+  } catch (err) {
+    console.error('❌ Create Order Error:', err.message);
+    for (const r of reservedItems) {
+      try {
+        if (isMongoActive()) {
+          await ProductModel.findOneAndUpdate({ id: r.productId }, { $inc: { stock: r.quantity } });
+        }
+      } catch (e) {}
+    }
+    return res.status(500).json({ success: false, message: 'Failed to create order', error: err.message });
+  }
+});
+
 app.all('/api/payment/sslcommerz/success', async (req, res) => {
   try {
     const { orderId, val_id, tran_id } = { ...req.query, ...req.body };
@@ -1645,23 +1895,56 @@ app.all('/api/payment/sslcommerz/success', async (req, res) => {
       return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=validation_failed`);
     }
 
+    let order = null;
     if (isMongoActive() && targetId) {
-      await OrderModel.findOneAndUpdate(
-        { id: targetId },
-        {
-          paymentStatus: 'Paid',
-          orderStatus: 'CONFIRMED',
-          paymentDetails: {
-            valId: val_id,
-            tranId: tran_id,
-            cardType: req.query.card_type || req.body.card_type,
-            storeAmount: req.query.store_amount || req.body.store_amount,
-            bankTranId: req.query.bank_tran_id || req.body.bank_tran_id
-          },
-          $push: { statusHistory: { status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz' } }
-        }
-      );
+      order = await OrderModel.findOne({ id: targetId });
+    } else {
+      order = ordersStore.find(o => o.id === targetId);
     }
+
+    if (!order) {
+      console.warn(`⚠️ SSLCommerz Success: Order #${targetId} not found in DB`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=order_not_found`);
+    }
+
+    // Security check: verify amount & tran_id match to prevent fake/tampered payments
+    const paidAmount = Number(valResult.data?.amount || valResult.data?.currency_amount);
+    const expectedAmount = Number(order.grandTotal);
+    const returnedTranId = valResult.data?.tran_id;
+
+    if (returnedTranId && returnedTranId !== targetId && returnedTranId !== order.id) {
+      console.warn(`⚠️ SSLCommerz Security Violation: tran_id mismatch. Expected ${order.id}, got ${returnedTranId}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=transaction_mismatch`);
+    }
+
+    if (isNaN(paidAmount) || Math.abs(paidAmount - expectedAmount) > 0.01) {
+      console.warn(`⚠️ SSLCommerz Security Violation: Amount mismatch for Order #${targetId}. Expected ${expectedAmount}, got ${paidAmount}`);
+      return res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId}&reason=amount_mismatch`);
+    }
+
+    if (isMongoActive()) {
+      order.paymentStatus = 'Paid';
+      order.orderStatus = 'CONFIRMED';
+      order.paymentDetails = {
+        valId: val_id,
+        tranId: tran_id,
+        cardType: req.query.card_type || req.body.card_type,
+        storeAmount: req.query.store_amount || req.body.store_amount,
+        bankTranId: req.query.bank_tran_id || req.body.bank_tran_id
+      };
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz' });
+      await order.save();
+    } else {
+      order.paymentStatus = 'Paid';
+      order.orderStatus = 'CONFIRMED';
+    }
+
+    // Send order confirmation emails now that online payment is verified
+    if (order.customer?.email) {
+      sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('Online order confirmation email error:', e.message));
+    }
+    sendAdminOrderNotificationEmail(order).catch(e => console.error('Online admin notification email error:', e.message));
 
     res.redirect(`${clientUrl}/checkout/success?orderId=${targetId}`);
   } catch (err) {

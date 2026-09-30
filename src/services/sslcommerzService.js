@@ -2,9 +2,13 @@
  * SSLCommerz Payment Gateway Integration Service
  */
 export function getSSLCommerzCredentials() {
-  const storeId = process.env.SSLCOMMERZ_STORE_ID || 'techc651f89bd78a10';
-  const storePassword = process.env.SSLCOMMERZ_STORE_PASSWORD || 'techc651f89bd78a10@ssl';
+  const storeId = process.env.SSLCOMMERZ_STORE_ID;
+  const storePassword = process.env.SSLCOMMERZ_STORE_PASSWORD;
   const isLive = String(process.env.SSLCOMMERZ_IS_LIVE || 'false').toLowerCase() === 'true';
+
+  if (!storeId || !storePassword) {
+    throw new Error('SSLCommerz credentials missing: SSLCOMMERZ_STORE_ID and SSLCOMMERZ_STORE_PASSWORD must be configured in environment variables.');
+  }
 
   const baseUrl = isLive
     ? 'https://securepay.sslcommerz.com'
