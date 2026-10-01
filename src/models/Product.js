@@ -25,6 +25,10 @@ const productSchema = new mongoose.Schema({
     enum: ['IN_STOCK', 'OUT_OF_STOCK', 'PRE_ORDER', 'UP_COMING'],
     default: 'IN_STOCK'
   },
+  badge: { type: String, default: '' },
+  keyFeatures: [{ type: String }],
+  productCode: { type: String },
+  soldCount: { type: Number, default: 0 },
   emiAvailable: { type: Boolean, default: true },
   isFeatured: { type: Boolean, default: false },
   seoTitle: { type: String },

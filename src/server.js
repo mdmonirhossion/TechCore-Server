@@ -243,24 +243,29 @@ connectDB().then(async (connected) => {
   isMongoConnected = connected;
   if (connected) {
     await seedSuperAdmin();
-    // Seed initial products to MongoDB Atlas if database is empty
+    // Seed initial products to MongoDB Atlas ONLY if database is completely empty
     try {
       const count = await ProductModel.countDocuments();
-      if (count < initialProducts.length) {
-        console.log('🌱 Syncing expanded product catalog to MongoDB Atlas collection...');
+      if (count === 0) {
+        console.log('🌱 Seeding initial products to empty MongoDB Atlas collection...');
         for (const prod of initialProducts) {
           await ProductModel.findOneAndUpdate(
             { slug: prod.slug },
-            { $set: prod },
+            { $setOnInsert: prod },
             { upsert: true, new: true }
           );
         }
         const updatedCount = await ProductModel.countDocuments();
-        console.log(`✅ Products successfully synced to MongoDB Atlas! Total: ${updatedCount}`);
+        console.log(`✅ Products successfully seeded to MongoDB Atlas! Total: ${updatedCount}`);
       } else {
-        console.log(`📦 MongoDB Atlas contains ${count} products.`);
+        console.log(`📦 MongoDB Atlas contains ${count} products. Preserving existing inventory without overwrite.`);
       }
-      await runCategoryBrandMigration();
+
+      // Run migration ONLY if explicitly commanded by environment variable
+      if (process.env.RUN_MIGRATION === 'true') {
+        console.log('🔄 RUN_MIGRATION flag detected. Running category/brand migration...');
+        await runCategoryBrandMigration();
+      }
     } catch (err) {
       console.error('Seed/Migration check error:', err.message);
     }
@@ -556,6 +561,7 @@ const normalizeProduct = (p) => {
     id: doc.id || (doc._id ? doc._id.toString() : ''),
     name: doc.name || '',
     sku: doc.sku || '',
+    productCode: doc.productCode || doc.sku || '',
     brand: doc.brand || 'Generic',
     category: doc.category || 'General',
     categorySlug: doc.categorySlug || (doc.category ? doc.category.toLowerCase().replace(/\s+/g, '-') : 'general'),
@@ -569,6 +575,7 @@ const normalizeProduct = (p) => {
     warranty: doc.warranty || '3 Years Warranty',
     rating: Number(doc.rating) || 5.0,
     reviewsCount: Number(doc.reviewsCount) || 0,
+    soldCount: Number(doc.soldCount) || 0,
     isFlashSale: Boolean(doc.isFlashSale),
     flashSalePrice: doc.flashSalePrice ? Number(doc.flashSalePrice) : Number(doc.discountPrice || doc.price || 0),
     slug: doc.slug || (doc.name ? doc.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') : 'product'),
@@ -991,6 +998,265 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
+// -------------------------------------------------------------
+// PRODUCT CRUD MANAGEMENT (ADMIN PROTECTED)
+// -------------------------------------------------------------
+
+// CREATE PRODUCT (POST /api/products)
+app.post('/api/products', requireApprovedAdmin, async (req, res) => {
+  try {
+    const {
+      name,
+      price,
+      discountPrice,
+      category,
+      brand,
+      stock,
+      stockStatus,
+      description,
+      images,
+      image,
+      specifications,
+      warranty,
+      badge,
+      keyFeatures,
+      productCode,
+      emiAvailable,
+      isFeatured,
+      isFlashSale,
+      flashSalePrice,
+      tags
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: 'Product title / name is required.' });
+    }
+    if (price === undefined || price === null || isNaN(Number(price))) {
+      return res.status(400).json({ success: false, message: 'Valid product price is required.' });
+    }
+
+    const prodId = req.body.id || `prod-${Date.now()}`;
+    const generatedSlug = await generateUniqueSlug(ProductModel, req.body.slug || name);
+    const catName = category || 'General';
+    const catSlug = slugify(catName);
+    const numPrice = Number(price);
+    const numDiscountPrice = discountPrice !== undefined && discountPrice !== '' && !isNaN(Number(discountPrice)) ? Number(discountPrice) : numPrice;
+    const numStock = stock !== undefined && stock !== '' && !isNaN(Number(stock)) ? Number(stock) : 10;
+    const computedStockStatus = stockStatus || (numStock > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK');
+    const imagesList = Array.isArray(images) && images.length > 0 ? images : (image ? [image] : ['https://images.unsplash.com/photo-1587202372775-e229f172b9d7?w=800']);
+    const specsObj = (typeof specifications === 'object' && specifications !== null) ? specifications : {};
+    const tagsList = Array.isArray(tags) ? tags : [];
+    const featuresList = Array.isArray(keyFeatures) ? keyFeatures : [];
+    const skuCode = req.body.sku || `SKU-${Date.now()}`;
+    const pCode = productCode || skuCode;
+
+    let categoryId = null;
+    let brandId = null;
+
+    if (isMongoActive()) {
+      try {
+        const catDoc = await CategoryModel.findOne({
+          $or: [{ slug: catSlug }, { name: new RegExp(`^${catName}$`, 'i') }, { title: new RegExp(`^${catName}$`, 'i') }]
+        }).lean();
+        if (catDoc) categoryId = catDoc._id;
+
+        if (brand) {
+          const brandDoc = await BrandModel.findOne({
+            $or: [{ slug: slugify(brand) }, { name: new RegExp(`^${brand}$`, 'i') }]
+          }).lean();
+          if (brandDoc) brandId = brandDoc._id;
+        }
+      } catch (lookupErr) {
+        console.warn('Category/Brand linking warning:', lookupErr.message);
+      }
+    }
+
+    const newProdData = {
+      id: prodId,
+      name: name.trim(),
+      slug: generatedSlug,
+      sku: skuCode,
+      productCode: pCode,
+      brand: brand || 'Generic',
+      category: catName,
+      categorySlug: catSlug,
+      builderCategory: req.body.builderCategory || catName,
+      price: numPrice,
+      discountPrice: numDiscountPrice,
+      stock: numStock,
+      stockStatus: computedStockStatus,
+      images: imagesList,
+      description: description || `${name} is a high performance tech component with official warranty.`,
+      specifications: specsObj,
+      warranty: warranty || '3 Years Official Warranty',
+      badge: badge || 'New Arrival',
+      keyFeatures: featuresList,
+      tags: tagsList,
+      emiAvailable: emiAvailable !== undefined ? Boolean(emiAvailable) : true,
+      isFeatured: Boolean(isFeatured),
+      isFlashSale: Boolean(isFlashSale),
+      flashSalePrice: flashSalePrice ? Number(flashSalePrice) : numDiscountPrice,
+      categoryId,
+      brandId,
+      rating: 5.0,
+      reviewsCount: 0,
+      soldCount: 0
+    };
+
+    let createdProduct = null;
+    if (isMongoActive()) {
+      createdProduct = await ProductModel.create(newProdData);
+    } else {
+      createdProduct = { ...newProdData, _id: prodId, createdAt: new Date().toISOString() };
+    }
+
+    // Keep productsStore cache in sync
+    productsStore.unshift(normalizeProduct(createdProduct));
+
+    return res.status(201).json({
+      success: true,
+      product: normalizeProduct(createdProduct)
+    });
+  } catch (err) {
+    console.error('Create product error:', err);
+    if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern || {})[0] || 'slug or id';
+      return res.status(409).json({
+        success: false,
+        message: `A product with this ${field} already exists in the catalog.`
+      });
+    }
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to create product on server',
+      error: err.message
+    });
+  }
+});
+
+// UPDATE PRODUCT (PUT /api/products/:id)
+app.put('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let product = null;
+
+    if (isMongoActive()) {
+      product = await ProductModel.findOne({
+        $or: [
+          { id },
+          { slug: id.toLowerCase() },
+          ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }] : [])
+        ]
+      });
+    }
+
+    if (!product && !isMongoActive()) {
+      product = productsStore.find(p => p.id === id || p.slug === id.toLowerCase() || p._id === id);
+    }
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    const updates = req.body;
+    const allowedFields = [
+      'name', 'price', 'discountPrice', 'stock', 'stockStatus', 'brand',
+      'category', 'description', 'images', 'specifications', 'warranty',
+      'badge', 'keyFeatures', 'productCode', 'sku', 'emiAvailable',
+      'isFeatured', 'isFlashSale', 'flashSalePrice', 'tags', 'builderCategory'
+    ];
+
+    allowedFields.forEach(field => {
+      if (updates[field] !== undefined) {
+        if (field === 'price' || field === 'discountPrice' || field === 'stock' || field === 'flashSalePrice') {
+          product[field] = Number(updates[field]);
+        } else if (field === 'emiAvailable' || field === 'isFeatured' || field === 'isFlashSale') {
+          product[field] = Boolean(updates[field]);
+        } else {
+          product[field] = updates[field];
+        }
+      }
+    });
+
+    if (updates.stock !== undefined && updates.stockStatus === undefined) {
+      product.stockStatus = Number(updates.stock) > 0 ? 'IN_STOCK' : 'OUT_OF_STOCK';
+    }
+
+    // Regenerate categorySlug if category changed
+    if (updates.category && updates.category !== product.category) {
+      product.categorySlug = slugify(updates.category);
+    }
+
+    // Do NOT silently change slug unless explicitly requested
+    if (updates.regenerateSlug && updates.name) {
+      product.slug = await generateUniqueSlug(ProductModel, updates.name, product._id);
+    } else if (updates.slug && updates.slug.trim()) {
+      const targetSlug = slugify(updates.slug.trim());
+      if (targetSlug !== product.slug) {
+        product.slug = targetSlug;
+      }
+    }
+
+    if (isMongoActive()) {
+      if (updates.category) {
+        const catDoc = await CategoryModel.findOne({
+          $or: [{ slug: product.categorySlug }, { name: new RegExp(`^${updates.category}$`, 'i') }, { title: new RegExp(`^${updates.category}$`, 'i') }]
+        }).lean();
+        if (catDoc) product.categoryId = catDoc._id;
+      }
+      if (updates.brand) {
+        const brandDoc = await BrandModel.findOne({
+          $or: [{ slug: slugify(updates.brand) }, { name: new RegExp(`^${updates.brand}$`, 'i') }]
+        }).lean();
+        if (brandDoc) product.brandId = brandDoc._id;
+      }
+      await product.save();
+    }
+
+    const normalized = normalizeProduct(product);
+    const storeIdx = productsStore.findIndex(p => p.id === product.id || p._id === product._id || p.slug === product.slug);
+    if (storeIdx !== -1) {
+      productsStore[storeIdx] = normalized;
+    }
+
+    return res.json({ success: true, product: normalized });
+  } catch (err) {
+    console.error('Update product error:', err);
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: 'Slug or ID conflicts with existing product.' });
+    }
+    return res.status(500).json({ success: false, message: 'Failed to update product', error: err.message });
+  }
+});
+
+// DELETE PRODUCT (DELETE /api/products/:id)
+app.delete('/api/products/:id', requireApprovedAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    let deleted = false;
+
+    if (isMongoActive()) {
+      const resMongo = await ProductModel.findOneAndDelete({
+        $or: [
+          { id },
+          { slug: id.toLowerCase() },
+          ...(mongoose.Types.ObjectId.isValid(id) ? [{ _id: id }] : [])
+        ]
+      });
+      if (resMongo) deleted = true;
+    }
+
+    const prevCount = productsStore.length;
+    productsStore = productsStore.filter(p => p.id !== id && p.slug !== id.toLowerCase() && p._id !== id);
+    if (productsStore.length < prevCount) deleted = true;
+
+    return res.json({ success: true, message: 'Product deleted successfully' });
+  } catch (err) {
+    console.error('Delete product error:', err);
+    return res.status(500).json({ success: false, message: 'Failed to delete product', error: err.message });
+  }
+});
+
 app.get('/api/home/featured', async (req, res) => {
   try {
     let allProds = [];
@@ -1154,8 +1420,18 @@ app.get('/api/products/:id/reviews', async (req, res) => {
     let total = 0;
 
     if (isMongoActive()) {
-      total = await ReviewModel.countDocuments({ productId: id, status: 'APPROVED' });
-      reviews = await ReviewModel.find({ productId: id, status: 'APPROVED' })
+      let matchIds = [id];
+      const prod = await ProductModel.findOne(
+        mongoose.Types.ObjectId.isValid(id) ? { $or: [{ _id: id }, { id }, { slug: id.toLowerCase() }] } : { $or: [{ id }, { slug: id.toLowerCase() }] }
+      ).lean();
+      if (prod) {
+        if (prod.id && !matchIds.includes(prod.id)) matchIds.push(prod.id);
+        if (prod._id && !matchIds.includes(prod._id.toString())) matchIds.push(prod._id.toString());
+        if (prod.slug && !matchIds.includes(prod.slug)) matchIds.push(prod.slug);
+      }
+
+      total = await ReviewModel.countDocuments({ productId: { $in: matchIds }, status: 'APPROVED' });
+      reviews = await ReviewModel.find({ productId: { $in: matchIds }, status: 'APPROVED' })
         .sort({ createdAt: -1 })
         .skip((pageNum - 1) * limitNum)
         .limit(limitNum)
@@ -1269,7 +1545,17 @@ app.get('/api/products/:id/qa', async (req, res) => {
     const { id } = req.params;
     let qas = [];
     if (isMongoActive()) {
-      qas = await ProductQaModel.find({ productId: id, status: 'APPROVED' }).sort({ createdAt: -1 }).lean();
+      let matchIds = [id];
+      const prod = await ProductModel.findOne(
+        mongoose.Types.ObjectId.isValid(id) ? { $or: [{ _id: id }, { id }, { slug: id.toLowerCase() }] } : { $or: [{ id }, { slug: id.toLowerCase() }] }
+      ).lean();
+      if (prod) {
+        if (prod.id && !matchIds.includes(prod.id)) matchIds.push(prod.id);
+        if (prod._id && !matchIds.includes(prod._id.toString())) matchIds.push(prod._id.toString());
+        if (prod.slug && !matchIds.includes(prod.slug)) matchIds.push(prod.slug);
+      }
+
+      qas = await ProductQaModel.find({ productId: { $in: matchIds }, status: 'APPROVED' }).sort({ createdAt: -1 }).lean();
     }
     res.json(qas);
   } catch (err) {
@@ -3410,31 +3696,7 @@ app.post('/api/admin/suppliers', requireApprovedAdmin, async (req, res) => {
   }
 });
 
-// 404 Fallback JSON Handler for Unmatched Routes (prevents 404 HTML & Vercel live script errors)
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: `API endpoint '${req.originalUrl}' not found on TechCore Server.`
-  });
-});
 
-const server = app.listen(PORT, () => {
-  console.log(`⚡ TechCore Express Server active on http://localhost:${PORT}`);
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${PORT} is currently occupied by another process.`);
-    console.log(`🔄 Attempting to listen on fallback port ${Number(PORT) + 1}...`);
-    app.listen(Number(PORT) + 1, () => {
-      console.log(`⚡ TechCore Express Server active on http://localhost:${Number(PORT) + 1}`);
-    });
-  } else {
-    console.error('Server error:', err);
-  }
-});
-
-export default app;
 
 
 // -------------------------------------------------------------
@@ -3644,3 +3906,28 @@ app.all(['/api/cron/cancel-unpaid-orders', '/api/orders/cron/cancel-expired'], a
   }
 });
 
+// 404 Fallback JSON Handler for Unmatched Routes (prevents 404 HTML & Vercel live script errors)
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `API endpoint '${req.originalUrl}' not found on TechCore Server.`
+  });
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`⚡ TechCore Express Server active on http://localhost:${PORT}`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is currently occupied by another process.`);
+    console.log(`🔄 Attempting to listen on fallback port ${Number(PORT) + 1}...`);
+    app.listen(Number(PORT) + 1, () => {
+      console.log(`⚡ TechCore Express Server active on http://localhost:${Number(PORT) + 1}`);
+    });
+  } else {
+    console.error('Server error:', err);
+  }
+});
+
+export default app;
