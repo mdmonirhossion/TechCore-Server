@@ -54,7 +54,8 @@ export async function initSSLCommerzPayment({ order, serverBaseUrl }) {
     ship_add1: order.customer?.address || 'Dhaka',
     ship_city: order.customer?.city || 'Dhaka',
     ship_postcode: '1200',
-    ship_country: 'Bangladesh'
+    ship_country: 'Bangladesh',
+    emi_option: '0'
   });
 
   console.log(`Initiating SSLCommerz session for Order #${order.id} (${order.grandTotal} BDT)...`);
