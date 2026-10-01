@@ -60,18 +60,29 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 5000;
 
-const clientUrls = process.env.CLIENT_URL
+const defaultClientUrls = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'https://techcore-client.vercel.app'
+];
+
+const envClientUrls = process.env.CLIENT_URL
   ? process.env.CLIENT_URL.split(',').map(url => url.trim()).filter(Boolean)
-  : ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5174'];
+  : [];
+
+const clientUrls = Array.from(new Set([...defaultClientUrls, ...envClientUrls]));
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || clientUrls.includes(origin)) {
+    if (!origin || clientUrls.includes(origin) || (typeof origin === 'string' && origin.endsWith('.vercel.app'))) {
       return callback(null, true);
     }
-    return callback(new Error('Not allowed by CORS'));
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-cron-secret']
 };
 
 app.use(cors(corsOptions));
