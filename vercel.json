@@ -6,6 +6,12 @@
       "use": "@vercel/node"
     }
   ],
+  "crons": [
+    {
+      "path": "/api/cron/cancel-unpaid-orders",
+      "schedule": "*/15 * * * *"
+    }
+  ],
   "routes": [
     {
       "src": "/(.*)",

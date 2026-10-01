@@ -15,6 +15,12 @@ import { connectDB, getLastMongoError } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
 import { ProductModel } from './models/Product.js';
 import { OrderModel } from './models/Order.js';
+
+import { ServiceRequestModel } from './models/ServiceRequest.js';
+import { SupplierModel } from './models/Supplier.js';
+import { WarrantyClaimModel } from './models/WarrantyClaim.js';
+import { WarrantyModel } from './models/Warranty.js';
+
 import { UserModel } from './models/User.js';
 import { verifyToken, requireApprovedAdmin, requireSuperAdmin } from './middleware/auth.js';
 
@@ -465,41 +471,9 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
 // -------------------------------------------------------------
 // 4. WARRANTY & SERVICE APIS
 // -------------------------------------------------------------
-app.get('/api/warranty/check', (req, res) => {
-  const { serial } = req.query;
-  if (!serial) return res.status(400).json({ message: 'Serial number required' });
 
-  res.json({
-    serialNumber: serial,
-    productName: 'ASUS Dual GeForce RTX 4060 OC 8GB',
-    purchaseDate: '2025-10-15',
-    expiryDate: '2028-10-15',
-    status: 'Active ✓',
-    warrantyYears: '3 Years'
-  });
-});
 
-app.post('/api/warranty/claim', (req, res) => {
-  const claim = { id: `WC-${Date.now()}`, ...req.body, status: 'Claim Received', createdAt: new Date().toISOString().split('T')[0] };
-  warrantyClaimsStore.push(claim);
-  res.status(201).json({ message: 'Warranty claim submitted successfully', claim });
-});
 
-app.get('/api/service', (req, res) => {
-  res.json(serviceRequestsStore);
-});
-
-app.post('/api/service', (req, res) => {
-  const newReq = {
-    id: `SR-${Math.floor(9000 + Math.random() * 1000)}`,
-    ...req.body,
-    status: 'Submitted',
-    technician: 'Unassigned',
-    createdAt: new Date().toISOString().split('T')[0]
-  };
-  serviceRequestsStore.unshift(newReq);
-  res.status(201).json(newReq);
-});
 
 // Banners & Home Featured Data Endpoints
 app.get('/api/banners', async (req, res) => {
@@ -3376,14 +3350,46 @@ app.patch('/api/admin/inventory/:id', requireApprovedAdmin, async (req, res) => 
   }
 });
 
-app.get('/api/admin/suppliers', requireApprovedAdmin, (req, res) => {
-  res.json(suppliersStore);
+app.get('/api/admin/suppliers', requireApprovedAdmin, async (req, res) => {
+  try {
+    let suppliers = [];
+    if (isMongoActive()) {
+      suppliers = await SupplierModel.find().sort({ createdAt: -1 }).lean();
+    }
+    if (!suppliers || suppliers.length === 0) {
+      suppliers = suppliersStore;
+    }
+    res.json(suppliers);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch suppliers', error: err.message });
+  }
 });
 
-app.post('/api/admin/suppliers', requireApprovedAdmin, (req, res) => {
-  const newSupplier = { id: `sup-${suppliersStore.length + 1}`, ...req.body };
-  suppliersStore.push(newSupplier);
-  res.status(201).json(newSupplier);
+app.post('/api/admin/suppliers', requireApprovedAdmin, async (req, res) => {
+  try {
+    const supplierId = `sup-${Date.now()}`;
+    const supplierData = {
+      id: supplierId,
+      name: req.body.name || 'Supplier',
+      company: req.body.company || req.body.name || 'Company',
+      phone: req.body.phone || '',
+      email: req.body.email || '',
+      category: req.body.category || 'General',
+      address: req.body.address || '',
+      status: req.body.status || 'ACTIVE'
+    };
+
+    let savedSupplier = supplierData;
+    if (isMongoActive()) {
+      savedSupplier = await SupplierModel.create(supplierData);
+    } else {
+      suppliersStore.push(supplierData);
+    }
+
+    res.status(201).json(savedSupplier);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to create supplier', error: err.message });
+  }
 });
 
 // 404 Fallback JSON Handler for Unmatched Routes (prevents 404 HTML & Vercel live script errors)
@@ -3411,3 +3417,212 @@ server.on('error', (err) => {
 });
 
 export default app;
+
+
+// -------------------------------------------------------------
+// WARRANTY & SERVICE APIS (MONGOOSE MIGRATED)
+// -------------------------------------------------------------
+app.get('/api/warranty/check', async (req, res) => {
+  try {
+    const { serial } = req.query;
+    if (!serial) {
+      return res.status(400).json({ success: false, message: 'Serial number query is required.' });
+    }
+
+    const searchSerial = String(serial).trim().toUpperCase();
+    let record = null;
+
+    if (isMongoActive()) {
+      record = await WarrantyModel.findOne({ serialNumber: searchSerial }).lean();
+    }
+
+    if (!record) {
+      // Memory fallback for demo seeds
+      if (searchSerial === 'SN-ASUS-9842' || searchSerial === 'SN-INTEL-14700K' || searchSerial === 'SN-4060-TEST') {
+        record = {
+          serialNumber: searchSerial,
+          productName: searchSerial.includes('ASUS') ? 'ASUS Dual GeForce RTX 4060 OC 8GB GDDR6' : 'Intel Core i7-14700K Processor',
+          purchaseDate: '2025-10-15',
+          expiryDate: '2028-10-15',
+          status: 'Active',
+          warrantyYears: '3 Years (36 Months)',
+          serviceCenter: 'Multiplan Center Branch (Level 4, Shop #408)'
+        };
+      }
+    }
+
+    if (!record) {
+      return res.status(404).json({
+        success: false,
+        message: 'অর্ডার / সিরিয়াল নম্বর পাওয়া যায়নি। দয়া করে সঠিক প্রডাক্ট সিরিয়াল নম্বর লিখুন। / Serial number not found in official warranty database.'
+      });
+    }
+
+    res.json({
+      success: true,
+      serialNumber: record.serialNumber,
+      productName: record.productName,
+      purchaseDate: record.purchaseDate || '2025-10-15',
+      expiryDate: record.expiryDate || '2028-10-15',
+      status: record.status || 'Active',
+      warrantyYears: record.warrantyYears || '3 Years',
+      serviceCenter: record.serviceCenter || 'Multiplan Center Branch (Level 4, Shop #408)'
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Warranty lookup error', error: err.message });
+  }
+});
+
+app.post('/api/warranty/claim', async (req, res) => {
+  try {
+    const { serialNumber, productName, customerName, customerPhone, issueDescription } = req.body;
+    const claimId = `WC-${Date.now()}`;
+    const claimData = {
+      id: claimId,
+      serialNumber: serialNumber || 'SN-UNKNOWN',
+      productName: productName || 'Hardware Component',
+      customerName: customerName || 'Customer',
+      customerPhone: customerPhone || '',
+      issueDescription: issueDescription || '',
+      status: 'Claim Received',
+      createdAt: new Date().toISOString().split('T')[0]
+    };
+
+    let savedClaim = null;
+    if (isMongoActive()) {
+      savedClaim = await WarrantyClaimModel.create(claimData);
+    } else {
+      warrantyClaimsStore.push(claimData);
+      savedClaim = claimData;
+    }
+
+    res.status(201).json({ message: 'Warranty claim submitted successfully', claim: savedClaim });
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to submit warranty claim', error: err.message });
+  }
+});
+
+app.get('/api/service', async (req, res) => {
+  try {
+    let requests = [];
+    if (isMongoActive()) {
+      requests = await ServiceRequestModel.find().sort({ createdAt: -1 }).lean();
+    }
+    if (!requests || requests.length === 0) {
+      requests = serviceRequestsStore;
+    }
+    res.json(requests);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch service requests', error: err.message });
+  }
+});
+
+app.post('/api/service', async (req, res) => {
+  try {
+    const { name, phone, email, deviceType, issueDescription } = req.body;
+    const newReq = {
+      id: `SR-${Math.floor(9000 + Math.random() * 1000)}`,
+      name: name || 'Customer',
+      phone: phone || '',
+      email: email || '',
+      deviceType: deviceType || 'Desktop PC',
+      issueDescription: issueDescription || '',
+      status: 'Submitted',
+      technician: 'Unassigned',
+      createdAt: new Date().toISOString().split('T')[0]
+    };
+
+    let savedReq = null;
+    if (isMongoActive()) {
+      savedReq = await ServiceRequestModel.create(newReq);
+    } else {
+      serviceRequestsStore.unshift(newReq);
+      savedReq = newReq;
+    }
+
+    res.status(201).json(savedReq);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to submit service request', error: err.message });
+  }
+});
+
+
+
+// -------------------------------------------------------------
+// UNPAID ORDER AUTOMATIC CANCELLATION CRON JOB (30-MIN TIMEOUT)
+// Protected by CRON_SECRET header
+// -------------------------------------------------------------
+app.all(['/api/cron/cancel-unpaid-orders', '/api/orders/cron/cancel-expired'], async (req, res) => {
+  try {
+    const cronSecret = process.env.CRON_SECRET;
+    const authHeader = req.headers['authorization'] || req.headers['x-cron-secret'];
+    const querySecret = req.query.secret;
+
+    if (
+      cronSecret &&
+      authHeader !== `Bearer ${cronSecret}` &&
+      authHeader !== cronSecret &&
+      querySecret !== cronSecret
+    ) {
+      return res.status(401).json({ success: false, message: 'Unauthorized cron request. Invalid CRON_SECRET.' });
+    }
+
+    const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    let cancelledCount = 0;
+
+    if (isMongoActive()) {
+      const expiredOrders = await OrderModel.find({
+        $or: [
+          { orderStatus: 'PENDING_PAYMENT' },
+          { paymentStatus: 'Unpaid', orderStatus: 'PENDING' }
+        ],
+        createdAt: { $lte: thirtyMinsAgo }
+      });
+
+      for (const order of expiredOrders) {
+        order.orderStatus = 'CANCELLED';
+        order.paymentStatus = 'Failed';
+        if (!order.statusHistory) order.statusHistory = [];
+        order.statusHistory.push({
+          status: 'CANCELLED',
+          time: new Date().toLocaleString(),
+          note: 'Order automatically cancelled due to 30-minute unpaid payment timeout'
+        });
+        await order.save();
+
+        // Restore reserved product stock
+        for (const item of (order.items || [])) {
+          const pId = item.productId || item.id;
+          if (pId) {
+            await ProductModel.findOneAndUpdate(
+              { $or: [{ id: pId }, { slug: pId }] },
+              { $inc: { stock: item.quantity } }
+            );
+          }
+        }
+        cancelledCount++;
+      }
+    } else {
+      ordersStore.forEach(order => {
+        if (
+          (order.orderStatus === 'PENDING_PAYMENT' || (order.paymentStatus === 'Unpaid' && order.orderStatus === 'PENDING')) &&
+          new Date(order.createdAt || Date.now()) <= thirtyMinsAgo
+        ) {
+          order.orderStatus = 'CANCELLED';
+          order.paymentStatus = 'Failed';
+          cancelledCount++;
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Expired unpaid order cancellation job complete. Cancelled ${cancelledCount} order(s).`,
+      cancelledCount,
+      executedAt: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Cron job execution error', error: err.message });
+  }
+});
+
