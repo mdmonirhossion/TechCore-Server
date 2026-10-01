@@ -1,8 +1,9 @@
 import 'dotenv/config';
 
+const DEFAULT_JWT_SECRET = 'techcore_super_secret_jwt_key_2026';
 if (!process.env.JWT_SECRET) {
-  console.error('FATAL ERROR: JWT_SECRET environment variable is missing.');
-  throw new Error('JWT_SECRET environment variable is required.');
+  process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
+  console.warn('⚠️ WARNING: JWT_SECRET environment variable is missing. Using default fallback key.');
 }
 import express from 'express';
 import cors from 'cors';
