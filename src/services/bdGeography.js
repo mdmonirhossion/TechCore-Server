@@ -16,7 +16,7 @@ export const bdDistrictsMap = {
     'Shariatpur', 'Gopalganj', 'Kishoreganj'
   ],
   'Chittagong': [
-    'Chittagong', 'Cox's Bazar', 'Comilla', 'Noakhali', 'Feni', 
+    'Chittagong', "Cox's Bazar", 'Comilla', 'Noakhali', 'Feni', 
     'Brahmanbaria', 'Chandpur', 'Rangamati', 'Bandarban', 'Khagrachhari', 'Lakshmipur'
   ],
   'Rajshahi': [
