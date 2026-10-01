@@ -9,7 +9,7 @@
   "crons": [
     {
       "path": "/api/cron/cancel-unpaid-orders",
-      "schedule": "*/15 * * * *"
+      "schedule": "0 0 * * *"
     }
   ],
   "routes": [
