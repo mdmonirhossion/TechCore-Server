@@ -1,4 +1,10 @@
+if (process.env.CLOUDINARY_URL && !process.env.CLOUDINARY_URL.startsWith('cloudinary://')) {
+  delete process.env.CLOUDINARY_URL;
+}
 import 'dotenv/config';
+if (process.env.CLOUDINARY_URL && !process.env.CLOUDINARY_URL.startsWith('cloudinary://')) {
+  delete process.env.CLOUDINARY_URL;
+}
 
 const DEFAULT_JWT_SECRET = 'techcore_super_secret_jwt_key_2026';
 if (!process.env.JWT_SECRET) {
