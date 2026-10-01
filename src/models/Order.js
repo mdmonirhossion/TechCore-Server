@@ -37,7 +37,7 @@ const orderSchema = new mongoose.Schema({
   grandTotal: { type: Number, required: true },
   paymentMethod: { 
     type: String, 
-    enum: ['COD', 'SSLCOMMERZ', 'BKASH', 'NAGAD', 'STRIPE', 'Cash on Delivery', 'SSLCommerz', 'bKash', 'Nagad', 'Stripe'], 
+    enum: ['COD', 'SSLCOMMERZ', 'BKASH', 'NAGAD', 'Cash on Delivery', 'SSLCommerz', 'bKash', 'Nagad'], 
     default: 'COD' 
   },
   paymentStatus: { 

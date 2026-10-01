@@ -47,7 +47,6 @@ import { runCategoryBrandMigration } from './scripts/migrateCategoriesAndBrands.
 
 import { categories, brands, products as initialProducts, sampleServiceRequests, sampleSuppliers } from './data/seedData.js';
 import { evaluatePcBuild, calculatePerformanceTier } from './services/compatibilityEngine.js';
-import { createStripePaymentIntent } from './services/stripeService.js';
 import { generateInvoicePdfBuffer } from './services/invoiceService.js';
 import { sendOrderConfirmationEmail, sendAdminOrderNotificationEmail, sendPasswordResetEmail } from './services/emailService.js';
 
@@ -173,29 +172,6 @@ app.get('/.well-known/appspecific/com.chrome.devtools.json', (req, res) => {
   res.status(200).json({ status: 'ok', devtools: true });
 });
 
-// -------------------------------------------------------------
-// STRIPE PAYMENT INTENT API
-// -------------------------------------------------------------
-app.post('/api/create-payment-intent', async (req, res) => {
-  try {
-    const { amount, email } = req.body;
-    if (!amount) {
-      return res.status(400).json({ message: 'Amount is required' });
-    }
-
-    const intent = await createStripePaymentIntent(amount, email || 'customer@techcore.com');
-    res.json({
-      success: true,
-      clientSecret: intent.clientSecret,
-      paymentIntentId: intent.paymentIntentId,
-      publishableKey: process.env.STRIPE_PUBLISHABLE_KEY
-    });
-  } catch (err) {
-    console.error('Stripe Payment Intent Creation Error:', err);
-    res.status(500).json({ message: 'Stripe payment creation failed', error: err.message });
-  }
-});
-
 // Connect to MongoDB Atlas
 let isMongoConnected = false;
 function isMongoActive() {
@@ -215,7 +191,7 @@ const seedSuperAdmin = async () => {
     const normalizedEmail = mainEmail.toLowerCase().trim();
     const existingAdmin = await UserModel.findOne({ email: normalizedEmail });
     if (!existingAdmin) {
-      console.log(`👑 Seeding Main Super Admin account (${normalizedEmail})...`);
+      console.log(`🕵️‍♂️Seeding Main Super Admin account (${normalizedEmail})...`);
       const hashedPassword = await bcrypt.hash(mainPassword, 10);
       await UserModel.create({
         name: 'TechCore Main Admin',
@@ -482,18 +458,9 @@ app.post('/api/auth/login', authRateLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/orders/:id', async (req, res) => {
-  if (isMongoConnected) {
-    try {
-      const dbO = await OrderModel.findOne({ id: req.params.id }).lean();
-      if (dbO) return res.json(dbO);
-    } catch (e) {}
-  }
+// Public Order Tracking & Status API (Placed BEFORE GET /api/orders/:id)
 
-  const order = ordersStore.find(o => o.id === req.params.id);
-  if (!order) return res.status(404).json({ message: 'Order not found' });
-  res.json(order);
-});
+// Protected Order Details Endpoint (Requires Order Owner or Admin authentication)
 
 // -------------------------------------------------------------
 // 4. WARRANTY & SERVICE APIS
@@ -624,6 +591,248 @@ const normalizeProduct = (p) => {
 };
 
 // -------------------------------------------------------------
+// CATEGORIES, BRANDS, OFFERS & PC BUILDER APIS
+// -------------------------------------------------------------
+app.get('/api/categories', async (req, res) => {
+  try {
+    let list = [];
+    if (isMongoActive()) {
+      try {
+        list = await CategoryModel.find().lean();
+      } catch (e) {}
+    }
+    if (!list || list.length === 0) {
+      list = categories || [];
+    }
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch categories', error: err.message });
+  }
+});
+
+app.get('/api/brands', async (req, res) => {
+  try {
+    let list = [];
+    if (isMongoActive()) {
+      try {
+        list = await BrandModel.find().lean();
+      } catch (e) {}
+    }
+    if (!list || list.length === 0) {
+      list = brands || [];
+    }
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch brands', error: err.message });
+  }
+});
+
+app.get('/api/offers/flash-sale', async (req, res) => {
+  try {
+    let flashProducts = [];
+    if (isMongoActive()) {
+      try {
+        flashProducts = await ProductModel.find({
+          $or: [{ isFlashSale: true }, { flashSalePrice: { $gt: 0 } }]
+        }).lean();
+      } catch (e) {}
+    }
+    if (!flashProducts || flashProducts.length === 0) {
+      flashProducts = (productsStore || []).filter(p => p.isFlashSale || (p.flashSalePrice && p.flashSalePrice > 0));
+    }
+    res.json({
+      success: true,
+      products: flashProducts
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to fetch flash sale offers', error: err.message });
+  }
+});
+
+app.post('/api/builder/check', (req, res) => {
+  try {
+    const selectedComponents = req.body.components || req.body || {};
+    const evaluation = evaluatePcBuild(selectedComponents);
+    res.json({
+      success: true,
+      compatible: evaluation.isCompatible,
+      isCompatible: evaluation.isCompatible,
+      issues: evaluation.issues || [],
+      errors: (evaluation.issues || []).filter(i => i.severity === 'error'),
+      warnings: (evaluation.issues || []).filter(i => i.severity === 'warning'),
+      validChecks: evaluation.validChecks || [],
+      totalTdp: evaluation.totalTdp || 0,
+      recommendedPsuWattage: evaluation.recommendedPsuWattage || 500,
+      performanceTier: evaluation.performanceTier || {}
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'PC builder compatibility check failed', error: err.message });
+  }
+});
+
+app.post('/api/builder/save', async (req, res) => {
+  try {
+    const buildId = 'BUILD-' + Date.now().toString(36).toUpperCase();
+    const buildData = {
+      id: buildId,
+      buildId: buildId,
+      name: req.body.name || req.body.title || 'Custom PC Build',
+      components: req.body.components || req.body || {},
+      totalPrice: Number(req.body.totalPrice) || 0,
+      createdAt: new Date().toISOString()
+    };
+
+    let savedBuild = buildData;
+    if (isMongoActive()) {
+      try {
+        savedBuild = await BuildModel.create(buildData);
+      } catch (e) {}
+    } else {
+      buildsStore.push(buildData);
+    }
+
+    res.status(201).json({
+      success: true,
+      buildId: buildId,
+      shareUrl: `/pc-builder?id=${buildId}`,
+      build: savedBuild
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Failed to save PC build', error: err.message });
+  }
+});
+
+// -------------------------------------------------------------
+
+// -------------------------------------------------------------
+// ORDER TRACKING & ORDER DETAIL APIS
+// -------------------------------------------------------------
+// Public Order Tracking API (GET /api/orders/track?query=...)
+app.get('/api/orders/track', async (req, res) => {
+  try {
+    const queryStr = req.query.query || req.query.orderId || req.query.phone || '';
+    const searchVal = String(queryStr).trim();
+
+    if (!searchVal) {
+      return res.status(400).json({
+        success: false,
+        message: 'অর্ডার আইডি বা ফোন নম্বর প্রদান করুন / Please provide an Order ID or Phone number.'
+      });
+    }
+
+    let order = null;
+    const isPhoneQuery = /^01[3-9]\d{8}$/.test(searchVal);
+
+    if (isMongoActive()) {
+      if (isPhoneQuery) {
+        order = await OrderModel.findOne({ 'customer.phone': searchVal }).sort({ createdAt: -1 }).lean();
+      } else {
+        order = await OrderModel.findOne({
+          $or: [
+            { id: searchVal },
+            { invoiceNo: searchVal },
+            { id: searchVal.toUpperCase() },
+            { invoiceNo: searchVal.toUpperCase() }
+          ]
+        }).lean();
+      }
+    }
+
+    if (!order) {
+      if (isPhoneQuery) {
+        order = ordersStore.find(o => o.customer?.phone === searchVal);
+      } else {
+        order = ordersStore.find(o =>
+          (o.id && (o.id === searchVal || o.id === searchVal.toUpperCase())) ||
+          (o.invoiceNo && (o.invoiceNo === searchVal || o.invoiceNo === searchVal.toUpperCase()))
+        );
+      }
+    }
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'অর্ডার পাওয়া যায়নি। সঠিক অর্ডার আইডি বা ফোন নম্বর দিয়ে আবার চেষ্টা করুন / Order not found. Please check your order ID or phone number.'
+      });
+    }
+
+    // Public tracking returns ONLY status & non-sensitive delivery fields (NO phone/address)
+    res.json({
+      success: true,
+      id: order.id || order.invoiceNo,
+      invoiceNo: order.invoiceNo || order.id,
+      orderStatus: order.orderStatus || 'PENDING',
+      paymentStatus: order.paymentStatus || 'Unpaid',
+      paymentMethod: order.paymentMethod || 'COD',
+      grandTotal: order.grandTotal || 0,
+      courier: order.courier || order.courierPartner || 'Steadfast Courier',
+      trackingNumber: order.trackingNumber || '',
+      statusHistory: order.statusHistory || order.trackingHistory || [],
+      createdAt: order.createdAt || new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      message: 'Order tracking failed on server',
+      error: err.message
+    });
+  }
+});
+
+// Protected Get Order By ID API (GET /api/orders/:id)
+// Only order owner (token matching user/email) or admin can view full details
+app.get('/api/orders/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    let order = null;
+
+    if (isMongoActive()) {
+      order = await OrderModel.findOne({
+        $or: [{ id }, { invoiceNo: id }, { id: id.toUpperCase() }]
+      }).lean();
+    }
+    if (!order) {
+      order = ordersStore.find(o => o.id === id || o.invoiceNo === id || o.id === id.toUpperCase());
+    }
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'অর্ডার পাওয়া যায়নি / Order not found' });
+    }
+
+    let isAuthorized = false;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const token = authHeader.split(' ')[1];
+        if (process.env.JWT_SECRET) {
+          const decoded = jwt.verify(token, process.env.JWT_SECRET);
+          if (decoded) {
+            if (['SUPER_ADMIN', 'CO_ADMIN', 'ADMIN'].includes(decoded.role)) {
+              isAuthorized = true;
+            } else if (
+              (decoded.id && order.user && (order.user.toString() === decoded.id.toString() || order.user._id?.toString() === decoded.id.toString())) ||
+              (decoded.email && order.customer?.email && order.customer.email.toLowerCase() === decoded.email.toLowerCase())
+            ) {
+              isAuthorized = true;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!isAuthorized) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied. Detailed order information is private to the order owner.'
+      });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ success: false, message: 'Fetch order error', error: err.message });
+  }
+});
+
+
 // PRODUCTS CATALOG & SEARCH APIS
 // -------------------------------------------------------------
 app.get('/api/products', async (req, res) => {
@@ -1758,6 +1967,25 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
     const deliveryFee = subtotal >= freeThreshold ? 0 : baseFee;
     const grandTotal = Math.max(0, subtotal - couponDiscount) + deliveryFee;
 
+    // Price/Stock change detection vs client values
+    let priceChanged = false;
+    for (const item of items) {
+      if (item.price !== undefined && item.price !== null) {
+        const rItem = reservedItems.find(r => r.productId === (item.productId || item.id));
+        if (rItem && Number(item.price) !== Number(rItem.price)) {
+          priceChanged = true;
+          break;
+        }
+      }
+    }
+    if (req.body.clientTotal && Math.abs(Number(req.body.clientTotal) - grandTotal) > 1) {
+      priceChanged = true;
+    }
+
+    const priceNotice = priceChanged
+      ? `Notice: Product price or stock changed during order placement. Final server-calculated grand total is ৳${grandTotal.toLocaleString()}. / পণ্যের দাম বা স্টকে পরিবর্তন ঘটেছে। সার্ভার প্রস্তুতকৃত চূড়ান্ত মোট মূল্য: ৳${grandTotal.toLocaleString()}।`
+      : '';
+
     // 5. Generate Secure Order ID & Expiration
     const orderId = 'INV-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
 
@@ -1782,6 +2010,8 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
       couponDiscount,
       deliveryFee,
       grandTotal,
+      priceChanged,
+      priceNotice,
       paymentMethod: method,
       paymentStatus: 'Unpaid',
       orderStatus: method === 'SSLCOMMERZ' ? 'PENDING_PAYMENT' : 'PENDING',
@@ -1812,7 +2042,10 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
 
       return res.status(201).json({
         success: true,
-        order: savedOrder
+        order: savedOrder,
+        grandTotal: savedOrder.grandTotal,
+        priceChanged: Boolean(priceChanged),
+        priceNotice: priceNotice || ''
       });
     } else if (method === 'SSLCOMMERZ') {
       const protocol = req.protocol || 'http';
@@ -2160,57 +2393,6 @@ app.post('/api/payment/sslcommerz/ipn', async (req, res) => {
   } catch (err) {
     console.error('IPN Error:', err.message);
     res.status(500).send('IPN Error');
-  }
-});
-
-// Public Order Tracking & Status API
-app.get('/api/orders/track', async (req, res) => {
-  try {
-    const { orderId, query, phone } = req.query;
-    const searchId = (orderId || query || '').trim();
-    const searchPhone = (phone || '').trim();
-
-    if (!searchId && !searchPhone) {
-      return res.status(400).json({ message: 'Order ID or phone number is required.' });
-    }
-
-    let order = null;
-    if (isMongoActive()) {
-      const dbQuery = {};
-      if (searchId) {
-        dbQuery.$or = [{ id: searchId }, { invoiceNo: searchId }];
-      } else if (searchPhone) {
-        dbQuery['customer.phone'] = searchPhone;
-      }
-      order = await OrderModel.findOne(dbQuery).sort({ createdAt: -1 }).lean();
-    }
-
-    if (!order) {
-      order = ordersStore.find(o => 
-        (searchId && (o.id === searchId || o.invoiceNo === searchId)) || 
-        (searchPhone && o.customer?.phone === searchPhone)
-      );
-    }
-
-    if (!order) {
-      return res.status(404).json({ message: 'No matching order found.' });
-    }
-
-    res.json({
-      id: order.id,
-      invoiceNo: order.invoiceNo || order.id,
-      customerName: order.customer?.name,
-      paymentMethod: order.paymentMethod,
-      orderStatus: order.orderStatus,
-      paymentStatus: order.paymentStatus,
-      grandTotal: order.grandTotal,
-      courier: order.courier || 'Pathao Courier',
-      trackingNumber: order.trackingNumber || `TRK-${order.id}`,
-      statusHistory: order.statusHistory || order.trackingHistory || [],
-      createdAt: order.createdAt
-    });
-  } catch (err) {
-    res.status(500).json({ message: 'Order tracking failed', error: err.message });
   }
 });
 
