@@ -6,10 +6,9 @@ if (process.env.CLOUDINARY_URL && !process.env.CLOUDINARY_URL.startsWith('cloudi
   delete process.env.CLOUDINARY_URL;
 }
 
-const DEFAULT_JWT_SECRET = 'techcore_super_secret_jwt_key_2026';
-if (!process.env.JWT_SECRET) {
-  process.env.JWT_SECRET = DEFAULT_JWT_SECRET;
-  console.warn('⚠️ WARNING: JWT_SECRET environment variable is missing. Using default fallback key.');
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+  console.error('❌ FATAL: JWT_SECRET environment variable is missing or shorter than 32 characters.');
+  process.exit(1);
 }
 import express from 'express';
 import cors from 'cors';
@@ -590,6 +589,81 @@ const normalizeProduct = (p) => {
   };
 };
 
+export function getEffectivePrice(prod) {
+  if (!prod) return 0;
+  if (prod.isFlashSale && Number(prod.flashSalePrice) > 0) {
+    return Number(prod.flashSalePrice);
+  }
+  if (Number(prod.discountPrice) > 0) {
+    return Number(prod.discountPrice);
+  }
+  return Number(prod.price) || 0;
+}
+
+export async function checkAndExpireOrder(order) {
+  if (!order) return order;
+  const isPastExpiry = (order.expiresAt && new Date(order.expiresAt) <= new Date()) ||
+    (!order.expiresAt && order.createdAt && new Date(order.createdAt) <= new Date(Date.now() - 30 * 60 * 1000));
+
+  if (order.orderStatus === 'PENDING_PAYMENT' && ['Unpaid', 'Pending'].includes(order.paymentStatus) && isPastExpiry) {
+    if (isMongoActive()) {
+      const updated = await OrderModel.findOneAndUpdate(
+        {
+          id: order.id,
+          orderStatus: 'PENDING_PAYMENT',
+          paymentStatus: { $in: ['Unpaid', 'Pending'] }
+        },
+        {
+          $set: { orderStatus: 'CANCELLED', paymentStatus: 'Failed' },
+          $push: {
+            statusHistory: {
+              status: 'CANCELLED',
+              time: new Date().toLocaleString(),
+              note: 'Order expired past expiresAt and cancelled automatically'
+            }
+          }
+        },
+        { new: true }
+      ).lean();
+
+      if (updated) {
+        for (const item of (updated.items || [])) {
+          const pId = item.productId || item.id;
+          const qty = Number(item.quantity) || 1;
+          if (pId && qty > 0) {
+            await ProductModel.findOneAndUpdate(
+              { $or: [{ id: pId }, { slug: pId }] },
+              { $inc: { stock: qty } }
+            );
+          }
+        }
+        return updated;
+      } else {
+        return await OrderModel.findOne({ id: order.id }).lean();
+      }
+    } else {
+      order.orderStatus = 'CANCELLED';
+      order.paymentStatus = 'Failed';
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({
+        status: 'CANCELLED',
+        time: new Date().toLocaleString(),
+        note: 'Order expired past expiresAt and cancelled automatically'
+      });
+      for (const item of (order.items || [])) {
+        const pId = item.productId || item.id;
+        const qty = Number(item.quantity) || 1;
+        if (pId && qty > 0) {
+          const p = productsStore.find(x => x.id === pId || x.slug === pId);
+          if (p) p.stock += qty;
+        }
+      }
+      return order;
+    }
+  }
+  return order;
+}
+
 // -------------------------------------------------------------
 // CATEGORIES, BRANDS, OFFERS & PC BUILDER APIS
 // -------------------------------------------------------------
@@ -757,6 +831,8 @@ app.get('/api/orders/track', async (req, res) => {
       });
     }
 
+    order = await checkAndExpireOrder(order);
+
     // Public tracking returns ONLY status & non-sensitive delivery fields (NO phone/address)
     res.json({
       success: true,
@@ -798,6 +874,8 @@ app.get('/api/orders/:id', async (req, res) => {
     if (!order) {
       return res.status(404).json({ success: false, message: 'অর্ডার পাওয়া যায়নি / Order not found' });
     }
+
+    order = await checkAndExpireOrder(order);
 
     let isAuthorized = false;
     const authHeader = req.headers.authorization;
@@ -2026,32 +2104,6 @@ app.put('/api/admin/delivery-rules', requireApprovedAdmin, async (req, res) => {
   }
 });
 
-// SSLCommerz Payment Gateway APIs
-app.post('/api/payment/sslcommerz/init', async (req, res) => {
-  try {
-    const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ message: 'Order ID is required' });
-
-    let order = null;
-    if (isMongoActive()) {
-      order = await OrderModel.findOne({ id: orderId }).lean();
-    }
-    if (!order) {
-      order = ordersStore.find(o => o.id === orderId);
-    }
-    if (!order) return res.status(404).json({ message: 'Order not found' });
-
-    const protocol = req.protocol || 'http';
-    const host = req.get('host') || 'localhost:5000';
-    const serverBaseUrl = `${protocol}://${host}`;
-
-    const sslRes = await initSSLCommerzPayment({ order, serverBaseUrl });
-    res.json(sslRes);
-  } catch (err) {
-    res.status(500).json({ message: 'SSLCommerz payment init failed', error: err.message });
-  }
-});
-
 // -------------------------------------------------------------
 // CREATE ORDER API (POST /api/orders)
 // -------------------------------------------------------------
@@ -2127,7 +2179,7 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
       reservedItems.push({
         productId: prod.id || prod._id,
         name: prod.name,
-        price: prod.price,
+        price: getEffectivePrice(prod),
         quantity: qty,
         image: Array.isArray(prod.images) ? prod.images[0] : (prod.image || '')
       });
@@ -2325,6 +2377,97 @@ app.post('/api/orders', orderRateLimiter, async (req, res) => {
   }
 });
 
+async function handleSslCommerzPaymentSuccess({ order, paymentDetails, source = 'SSLCommerz' }) {
+  if (order.orderStatus === 'CANCELLED') {
+    // Late payment received for a CANCELLED order: try to re-reserve stock atomically (stock >= qty)
+    const reReserved = [];
+    let reReserveSuccess = true;
+
+    for (const item of (order.items || [])) {
+      const pId = item.productId || item.id;
+      const qty = Number(item.quantity) || 1;
+      if (!pId) continue;
+
+      if (isMongoActive()) {
+        const prod = await ProductModel.findOneAndUpdate(
+          { $or: [{ id: pId }, { slug: pId }], stock: { $gte: qty } },
+          { $inc: { stock: -qty } },
+          { new: true }
+        );
+        if (prod) {
+          reReserved.push({ productId: pId, quantity: qty });
+        } else {
+          reReserveSuccess = false;
+          break;
+        }
+      } else {
+        const prod = productsStore.find(p => (p.id === pId || p.slug === pId) && p.stock >= qty);
+        if (prod) {
+          prod.stock -= qty;
+          reReserved.push({ productId: pId, quantity: qty });
+        } else {
+          reReserveSuccess = false;
+          break;
+        }
+      }
+    }
+
+    if (reReserveSuccess) {
+      order.paymentStatus = 'Paid';
+      order.orderStatus = 'CONFIRMED';
+      order.paymentDetails = paymentDetails;
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({
+        status: 'CONFIRMED',
+        time: new Date().toLocaleString(),
+        note: `Late payment verified via ${source}; stock successfully re-reserved`
+      });
+      if (isMongoActive()) await order.save();
+
+      if (order.customer?.email) {
+        sendOrderConfirmationEmail({ order }).catch(e => console.error('Confirmation email error:', e.message));
+      }
+      sendAdminOrderNotificationEmail({ order }).catch(e => console.error('Admin notification error:', e.message));
+    } else {
+      // Rollback any re-reserved stock
+      for (const r of reReserved) {
+        if (isMongoActive()) {
+          await ProductModel.findOneAndUpdate({ $or: [{ id: r.productId }, { slug: r.productId }] }, { $inc: { stock: r.quantity } });
+        } else {
+          const p = productsStore.find(x => x.id === r.productId || x.slug === r.productId);
+          if (p) p.stock += r.quantity;
+        }
+      }
+
+      order.paymentStatus = 'Paid';
+      order.orderStatus = 'PAID_NEEDS_REVIEW';
+      order.paymentDetails = paymentDetails;
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({
+        status: 'PAID_NEEDS_REVIEW',
+        time: new Date().toLocaleString(),
+        note: `Late payment received via ${source} for CANCELLED order, but stock was unavailable. Requires admin review.`
+      });
+      if (isMongoActive()) await order.save();
+
+      sendAdminOrderNotificationEmail({ order }).catch(e => console.error('Admin order review notification error:', e.message));
+    }
+  } else {
+    // Normal payment flow
+    order.paymentStatus = 'Paid';
+    order.orderStatus = 'CONFIRMED';
+    order.paymentDetails = paymentDetails;
+    if (!order.statusHistory) order.statusHistory = [];
+    order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: `Payment verified via ${source}` });
+    if (isMongoActive()) await order.save();
+
+    if (order.customer?.email) {
+      sendOrderConfirmationEmail({ order }).catch(e => console.error('Online confirmation email error:', e.message));
+    }
+    sendAdminOrderNotificationEmail({ order }).catch(e => console.error('Online admin notification error:', e.message));
+  }
+}
+
 app.all('/api/payment/sslcommerz/success', async (req, res) => {
   try {
     const { orderId, val_id, tran_id, amount, currency } = { ...req.query, ...req.body };
@@ -2386,7 +2529,7 @@ app.all('/api/payment/sslcommerz/success', async (req, res) => {
       return res.redirect(`${clientUrl}/checkout/fail?orderId=${order.id}&reason=amount_mismatch`);
     }
 
-    // On Success: Set Paid + CONFIRMED and save paymentDetails
+    // Process valid payment (handles both normal orders and late payment on CANCELLED orders)
     const paymentDetails = {
       valId: val_id,
       tranId: paidTranId,
@@ -2397,24 +2540,7 @@ app.all('/api/payment/sslcommerz/success', async (req, res) => {
       cardBrand: valData.card_brand || 'N/A'
     };
 
-    if (isMongoActive()) {
-      order.paymentStatus = 'Paid';
-      order.orderStatus = 'CONFIRMED';
-      order.paymentDetails = paymentDetails;
-      if (!order.statusHistory) order.statusHistory = [];
-      order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz' });
-      await order.save();
-    } else {
-      order.paymentStatus = 'Paid';
-      order.orderStatus = 'CONFIRMED';
-      order.paymentDetails = paymentDetails;
-    }
-
-    // Send confirmation emails
-    if (order.customer?.email) {
-      sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('Online confirmation email error:', e.message));
-    }
-    sendAdminOrderNotificationEmail(order).catch(e => console.error('Online admin notification error:', e.message));
+    await handleSslCommerzPaymentSuccess({ order, paymentDetails, source: 'SSLCommerz' });
 
     return res.redirect(`${clientUrl}/checkout/success?orderId=${order.id}`);
   } catch (err) {
@@ -2431,32 +2557,50 @@ app.all('/api/payment/sslcommerz/fail', async (req, res) => {
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
     if (targetId) {
-      let order = null;
       if (isMongoActive()) {
-        order = await OrderModel.findOne({ id: targetId });
-      } else {
-        order = ordersStore.find(o => o.id === targetId);
-      }
+        const order = await OrderModel.findOneAndUpdate(
+          {
+            id: targetId,
+            orderStatus: 'PENDING_PAYMENT',
+            paymentStatus: { $in: ['Unpaid', 'Pending'] }
+          },
+          {
+            $set: { orderStatus: 'CANCELLED', paymentStatus: 'Failed' },
+            $push: {
+              statusHistory: {
+                status: 'FAILED',
+                time: new Date().toLocaleString(),
+                note: 'Payment failed via SSLCommerz'
+              }
+            }
+          },
+          { new: true }
+        );
 
-      if (order && order.paymentStatus !== 'Paid') {
-        if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
-          order.paymentStatus = 'Failed';
-          order.orderStatus = 'CANCELLED';
-          if (!order.statusHistory) order.statusHistory = [];
-          order.statusHistory.push({ status: 'FAILED', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz' });
-          if (isMongoActive()) await order.save();
-
-          // Restore stock
+        if (order) {
+          // Restore stock exactly once
           for (const item of (order.items || [])) {
             const pId = item.productId || item.id;
             const qty = Number(item.quantity) || 1;
             if (pId && qty > 0) {
-              if (isMongoActive()) {
-                await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
-              } else {
-                const p = productsStore.find(x => x.id === pId);
-                if (p) p.stock += qty;
-              }
+              await ProductModel.findOneAndUpdate({ $or: [{ id: pId }, { slug: pId }] }, { $inc: { stock: qty } });
+            }
+          }
+        }
+      } else {
+        const order = ordersStore.find(o => o.id === targetId && o.orderStatus === 'PENDING_PAYMENT' && ['Unpaid', 'Pending'].includes(o.paymentStatus));
+        if (order) {
+          order.orderStatus = 'CANCELLED';
+          order.paymentStatus = 'Failed';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'FAILED', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz' });
+
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              const p = productsStore.find(x => x.id === pId || x.slug === pId);
+              if (p) p.stock += qty;
             }
           }
         }
@@ -2477,32 +2621,50 @@ app.all('/api/payment/sslcommerz/cancel', async (req, res) => {
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
 
     if (targetId) {
-      let order = null;
       if (isMongoActive()) {
-        order = await OrderModel.findOne({ id: targetId });
-      } else {
-        order = ordersStore.find(o => o.id === targetId);
-      }
+        const order = await OrderModel.findOneAndUpdate(
+          {
+            id: targetId,
+            orderStatus: 'PENDING_PAYMENT',
+            paymentStatus: { $in: ['Unpaid', 'Pending'] }
+          },
+          {
+            $set: { orderStatus: 'CANCELLED', paymentStatus: 'Failed' },
+            $push: {
+              statusHistory: {
+                status: 'CANCELLED',
+                time: new Date().toLocaleString(),
+                note: 'Payment cancelled by user'
+              }
+            }
+          },
+          { new: true }
+        );
 
-      if (order && order.paymentStatus !== 'Paid') {
-        if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
-          order.paymentStatus = 'Failed';
-          order.orderStatus = 'CANCELLED';
-          if (!order.statusHistory) order.statusHistory = [];
-          order.statusHistory.push({ status: 'CANCELLED', time: new Date().toLocaleString(), note: 'Payment cancelled by user' });
-          if (isMongoActive()) await order.save();
-
-          // Restore stock
+        if (order) {
+          // Restore stock exactly once
           for (const item of (order.items || [])) {
             const pId = item.productId || item.id;
             const qty = Number(item.quantity) || 1;
             if (pId && qty > 0) {
-              if (isMongoActive()) {
-                await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
-              } else {
-                const p = productsStore.find(x => x.id === pId);
-                if (p) p.stock += qty;
-              }
+              await ProductModel.findOneAndUpdate({ $or: [{ id: pId }, { slug: pId }] }, { $inc: { stock: qty } });
+            }
+          }
+        }
+      } else {
+        const order = ordersStore.find(o => o.id === targetId && o.orderStatus === 'PENDING_PAYMENT' && ['Unpaid', 'Pending'].includes(o.paymentStatus));
+        if (order) {
+          order.orderStatus = 'CANCELLED';
+          order.paymentStatus = 'Failed';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'CANCELLED', time: new Date().toLocaleString(), note: 'Payment cancelled by user' });
+
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              const p = productsStore.find(x => x.id === pId || x.slug === pId);
+              if (p) p.stock += qty;
             }
           }
         }
@@ -2557,44 +2719,54 @@ app.post('/api/payment/sslcommerz/ipn', async (req, res) => {
             cardBrand: valData.card_brand || 'N/A'
           };
 
-          if (isMongoActive()) {
-            order.paymentStatus = 'Paid';
-            order.orderStatus = 'CONFIRMED';
-            order.paymentDetails = paymentDetails;
-            if (!order.statusHistory) order.statusHistory = [];
-            order.statusHistory.push({ status: 'PAID_ONLINE', time: new Date().toLocaleString(), note: 'Payment verified via SSLCommerz IPN' });
-            await order.save();
-          } else {
-            order.paymentStatus = 'Paid';
-            order.orderStatus = 'CONFIRMED';
-            order.paymentDetails = paymentDetails;
-          }
-
-          if (order.customer?.email) {
-            sendOrderConfirmationEmail(order, order.customer.email).catch(e => console.error('IPN email error:', e.message));
-          }
-          sendAdminOrderNotificationEmail(order).catch(e => console.error('IPN admin email error:', e.message));
+          await handleSslCommerzPaymentSuccess({ order, paymentDetails, source: 'SSLCommerz IPN' });
 
           return res.status(200).send('IPN payment verified and processed');
         }
       }
     } else if (status === 'FAILED' || status === 'CANCELLED') {
-      if (order.paymentStatus !== 'Failed' && order.orderStatus !== 'CANCELLED') {
-        order.paymentStatus = 'Failed';
-        order.orderStatus = 'CANCELLED';
-        if (!order.statusHistory) order.statusHistory = [];
-        order.statusHistory.push({ status: 'FAILED_IPN', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz IPN' });
-        if (isMongoActive()) await order.save();
+      if (isMongoActive()) {
+        const order = await OrderModel.findOneAndUpdate(
+          {
+            id: tran_id,
+            orderStatus: 'PENDING_PAYMENT',
+            paymentStatus: { $in: ['Unpaid', 'Pending'] }
+          },
+          {
+            $set: { orderStatus: 'CANCELLED', paymentStatus: 'Failed' },
+            $push: {
+              statusHistory: {
+                status: 'FAILED_IPN',
+                time: new Date().toLocaleString(),
+                note: 'Payment failed via SSLCommerz IPN'
+              }
+            }
+          },
+          { new: true }
+        );
 
-        // Restore stock
-        for (const item of (order.items || [])) {
-          const pId = item.productId || item.id;
-          const qty = Number(item.quantity) || 1;
-          if (pId && qty > 0) {
-            if (isMongoActive()) {
-              await ProductModel.findOneAndUpdate({ id: pId }, { $inc: { stock: qty } });
-            } else {
-              const p = productsStore.find(x => x.id === pId);
+        if (order) {
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              await ProductModel.findOneAndUpdate({ $or: [{ id: pId }, { slug: pId }] }, { $inc: { stock: qty } });
+            }
+          }
+        }
+      } else {
+        const order = ordersStore.find(o => o.id === tran_id && o.orderStatus === 'PENDING_PAYMENT' && ['Unpaid', 'Pending'].includes(o.paymentStatus));
+        if (order) {
+          order.orderStatus = 'CANCELLED';
+          order.paymentStatus = 'Failed';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({ status: 'FAILED_IPN', time: new Date().toLocaleString(), note: 'Payment failed via SSLCommerz IPN' });
+
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              const p = productsStore.find(x => x.id === pId || x.slug === pId);
               if (p) p.stock += qty;
             }
           }
@@ -2634,7 +2806,7 @@ app.post('/api/emi/calculate', (req, res) => {
 app.patch('/api/admin/orders/:id/status', requireApprovedAdmin, async (req, res) => {
   try {
     const { status, courier, trackingNumber, note } = req.body;
-    const validStatuses = ['PENDING_PAYMENT', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED'];
+    const validStatuses = ['PENDING_PAYMENT', 'PENDING', 'CONFIRMED', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED', 'RETURNED', 'PAID_NEEDS_REVIEW'];
     if (!status || !validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid order status value' });
     }
@@ -3771,61 +3943,93 @@ app.post('/api/service', async (req, res) => {
 app.all(['/api/cron/cancel-unpaid-orders', '/api/orders/cron/cancel-expired'], async (req, res) => {
   try {
     const cronSecret = process.env.CRON_SECRET;
-    const authHeader = req.headers['authorization'] || req.headers['x-cron-secret'];
-    const querySecret = req.query.secret;
+    if (!cronSecret) {
+      return res.status(500).json({ success: false, message: 'CRON_SECRET environment variable is not configured.' });
+    }
 
-    if (
-      cronSecret &&
-      authHeader !== `Bearer ${cronSecret}` &&
-      authHeader !== cronSecret &&
-      querySecret !== cronSecret
-    ) {
+    const authHeader = req.headers['authorization'];
+    if (authHeader !== `Bearer ${cronSecret}`) {
       return res.status(401).json({ success: false, message: 'Unauthorized cron request. Invalid CRON_SECRET.' });
     }
 
     const thirtyMinsAgo = new Date(Date.now() - 30 * 60 * 1000);
+    const now = new Date();
     let cancelledCount = 0;
 
     if (isMongoActive()) {
-      const expiredOrders = await OrderModel.find({
+      const expiredCandidateOrders = await OrderModel.find({
+        orderStatus: 'PENDING_PAYMENT',
+        paymentStatus: { $in: ['Unpaid', 'Pending'] },
         $or: [
-          { orderStatus: 'PENDING_PAYMENT' },
-          { paymentStatus: 'Unpaid', orderStatus: 'PENDING' }
-        ],
-        createdAt: { $lte: thirtyMinsAgo }
-      });
+          { expiresAt: { $lte: now } },
+          { expiresAt: { $exists: false }, createdAt: { $lte: thirtyMinsAgo } },
+          { expiresAt: null, createdAt: { $lte: thirtyMinsAgo } }
+        ]
+      }).lean();
 
-      for (const order of expiredOrders) {
-        order.orderStatus = 'CANCELLED';
-        order.paymentStatus = 'Failed';
-        if (!order.statusHistory) order.statusHistory = [];
-        order.statusHistory.push({
-          status: 'CANCELLED',
-          time: new Date().toLocaleString(),
-          note: 'Order automatically cancelled due to 30-minute unpaid payment timeout'
-        });
-        await order.save();
+      for (const expOrder of expiredCandidateOrders) {
+        // Atomic status guard guarantees stock is restored exactly once per expired order
+        const order = await OrderModel.findOneAndUpdate(
+          {
+            id: expOrder.id,
+            orderStatus: 'PENDING_PAYMENT',
+            paymentStatus: { $in: ['Unpaid', 'Pending'] }
+          },
+          {
+            $set: { orderStatus: 'CANCELLED', paymentStatus: 'Failed' },
+            $push: {
+              statusHistory: {
+                status: 'CANCELLED',
+                time: new Date().toLocaleString(),
+                note: 'Order automatically cancelled due to payment timeout'
+              }
+            }
+          },
+          { new: true }
+        );
 
-        // Restore reserved product stock
-        for (const item of (order.items || [])) {
-          const pId = item.productId || item.id;
-          if (pId) {
-            await ProductModel.findOneAndUpdate(
-              { $or: [{ id: pId }, { slug: pId }] },
-              { $inc: { stock: item.quantity } }
-            );
+        if (order) {
+          // Restore reserved product stock exactly once
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              await ProductModel.findOneAndUpdate(
+                { $or: [{ id: pId }, { slug: pId }] },
+                { $inc: { stock: qty } }
+              );
+            }
           }
+          cancelledCount++;
         }
-        cancelledCount++;
       }
     } else {
       ordersStore.forEach(order => {
+        const isPastExp = (order.expiresAt && new Date(order.expiresAt) <= now) ||
+          (!order.expiresAt && order.createdAt && new Date(order.createdAt) <= thirtyMinsAgo);
+
         if (
-          (order.orderStatus === 'PENDING_PAYMENT' || (order.paymentStatus === 'Unpaid' && order.orderStatus === 'PENDING')) &&
-          new Date(order.createdAt || Date.now()) <= thirtyMinsAgo
+          order.orderStatus === 'PENDING_PAYMENT' &&
+          ['Unpaid', 'Pending'].includes(order.paymentStatus) &&
+          isPastExp
         ) {
           order.orderStatus = 'CANCELLED';
           order.paymentStatus = 'Failed';
+          if (!order.statusHistory) order.statusHistory = [];
+          order.statusHistory.push({
+            status: 'CANCELLED',
+            time: new Date().toLocaleString(),
+            note: 'Order automatically cancelled due to payment timeout'
+          });
+
+          for (const item of (order.items || [])) {
+            const pId = item.productId || item.id;
+            const qty = Number(item.quantity) || 1;
+            if (pId && qty > 0) {
+              const p = productsStore.find(x => x.id === pId || x.slug === pId);
+              if (p) p.stock += qty;
+            }
+          }
           cancelledCount++;
         }
       });
