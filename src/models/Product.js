@@ -40,13 +40,18 @@ const productSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 // High-concurrency database indexing for Star-Tech style fast search & filter
-productSchema.index({ slug: 1 });
 productSchema.index({ categorySlug: 1 });
 productSchema.index({ categoryId: 1 });
 productSchema.index({ brand: 1 });
 productSchema.index({ brandId: 1 });
 productSchema.index({ price: 1 });
+productSchema.index({ discountPrice: 1 });
 productSchema.index({ stockStatus: 1 });
+productSchema.index({ createdAt: -1 });
+productSchema.index({ rating: -1 });
+productSchema.index({ categoryId: 1, createdAt: -1 });
+productSchema.index({ categorySlug: 1, createdAt: -1 });
+productSchema.index({ brand: 1, createdAt: -1 });
 productSchema.index({ builderCategory: 1 });
 productSchema.index({ name: 'text', brand: 'text', category: 'text', tags: 'text' });
 

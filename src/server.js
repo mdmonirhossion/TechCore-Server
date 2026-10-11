@@ -62,6 +62,7 @@ import { categories, brands, products as initialProducts, sampleServiceRequests,
 import { evaluatePcBuild, calculatePerformanceTier } from './services/compatibilityEngine.js';
 import { generateInvoicePdfBuffer } from './services/invoiceService.js';
 import { sendOrderConfirmationEmail, sendAdminOrderNotificationEmail, sendPasswordResetEmail } from './services/emailService.js';
+import { buildProductQuery, filterInMemoryProducts } from './services/productFilters.js';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -592,6 +593,7 @@ const normalizeProduct = (p) => {
 // -------------------------------------------------------------
 // CATEGORIES, BRANDS, OFFERS & PC BUILDER APIS
 // -------------------------------------------------------------
+app.use('/api/categories', (await import('./routes/categories.js')).default);
 app.get('/api/categories', async (req, res) => {
   try {
     let list = [];
@@ -836,76 +838,14 @@ app.get('/api/orders/:id', async (req, res) => {
 // -------------------------------------------------------------
 app.get('/api/products', async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.max(1, parseInt(req.query.limit, 10) || 20);
-    const skip = (page - 1) * limit;
-
-    const { category, brand, search, minPrice, maxPrice, inStock, emi, sort, isFlashSale, isFeatured } = req.query;
-
-    const mongoQuery = {};
-
-    if (category) {
-      const catLower = category.toLowerCase().trim();
-      mongoQuery.$or = [
-        { categorySlug: catLower },
-        { category: new RegExp(`^${category}$`, 'i') }
-      ];
-    }
-
-    if (brand) {
-      mongoQuery.brand = new RegExp(`^${brand}$`, 'i');
-    }
-
-    if (search) {
-      const searchRegex = new RegExp(search.trim(), 'i');
-      const searchConditions = [
-        { name: searchRegex },
-        { brand: searchRegex },
-        { category: searchRegex },
-        { tags: searchRegex },
-        { sku: searchRegex }
-      ];
-      if (mongoQuery.$or) {
-        mongoQuery.$and = [
-          { $or: mongoQuery.$or },
-          { $or: searchConditions }
-        ];
-        delete mongoQuery.$or;
-      } else {
-        mongoQuery.$or = searchConditions;
-      }
-    }
-
-    if (minPrice || maxPrice) {
-      mongoQuery.price = {};
-      if (minPrice) mongoQuery.price.$gte = Number(minPrice);
-      if (maxPrice) mongoQuery.price.$lte = Number(maxPrice);
-    }
-
-    if (inStock === 'true') {
-      mongoQuery.$or = [
-        { stock: { $gt: 0 } },
-        { stockStatus: 'IN_STOCK' }
-      ];
-    }
-
-    if (emi === 'true') {
-      mongoQuery.emiAvailable = true;
-    }
-
-    if (isFlashSale === 'true') {
-      mongoQuery.isFlashSale = true;
-    }
-
-    if (isFeatured === 'true') {
-      mongoQuery.isFeatured = true;
-    }
-
-    let sortOptions = { createdAt: -1 };
-    if (sort === 'price_asc') sortOptions = { price: 1 };
-    else if (sort === 'price_desc') sortOptions = { price: -1 };
-    else if (sort === 'rating') sortOptions = { rating: -1 };
-    else if (sort === 'newest') sortOptions = { createdAt: -1 };
+    const {
+      mongoQuery,
+      sortOptions,
+      page,
+      limit,
+      skip,
+      resolvedCategoryContext
+    } = await buildProductQuery(req.query);
 
     let totalProducts = 0;
     let rawProducts = [];
@@ -921,11 +861,7 @@ app.get('/api/products', async (req, res) => {
 
     // In-memory fallback if MongoDB is empty or disconnected
     if (rawProducts.length === 0 && !isMongoActive()) {
-      let filtered = [...productsStore];
-      if (category) filtered = filtered.filter(p => (p.categorySlug === category.toLowerCase() || p.category.toLowerCase() === category.toLowerCase()));
-      if (brand) filtered = filtered.filter(p => p.brand.toLowerCase() === brand.toLowerCase());
-      if (search) filtered = filtered.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
-
+      let filtered = filterInMemoryProducts(productsStore, req.query, resolvedCategoryContext);
       totalProducts = filtered.length;
       rawProducts = filtered.slice(skip, skip + limit);
     }
