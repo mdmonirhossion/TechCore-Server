@@ -50,7 +50,13 @@ const orderSchema = new mongoose.Schema({
     tranId: { type: String },
     cardType: { type: String },
     storeAmount: { type: Number },
-    bankTranId: { type: String }
+    bankTranId: { type: String },
+    invoiceId: { type: String },
+    invoiceRefer: { type: String },
+    payUrl: { type: String },
+    qrImageUrl: { type: String },
+    qrImagePayUrl: { type: String },
+    banglaQrCode: { type: String }
   },
   orderStatus: { 
     type: String, 

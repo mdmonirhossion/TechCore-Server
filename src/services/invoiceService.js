@@ -44,6 +44,9 @@ export function generateInvoicePdfBuffer(order) {
       doc.fillColor('#ffffff').fontSize(9).font('Helvetica-Bold').text(`Payment Status: ${order.paymentStatus || 'Pending'}`, 315, startY + 44);
       doc.fillColor('#cbd5e1').fontSize(9).font('Helvetica').text(`Delivery Zone: ${order.customer?.zone || 'Dhaka Inside'}`, 315, startY + 60);
       doc.fillColor('#cbd5e1').fontSize(9).font('Helvetica').text(`Order Status: ${order.orderStatus || 'Confirmed'}`, 315, startY + 74);
+      if (order.paymentDetails?.invoiceId) {
+        doc.fillColor('#cbd5e1').fontSize(8).font('Helvetica').text(`SSLCommerz Inv: ${order.paymentDetails.invoiceId}`, 315, startY + 86);
+      }
 
       // --- 3. Items Table Header ---
       const tableTop = 235;
@@ -89,6 +92,9 @@ export function generateInvoicePdfBuffer(order) {
       doc.fillColor('#00f2fe').fontSize(11).font('Helvetica-Bold').text(`Tk ${(order.grandTotal || 0).toLocaleString()}`, 450, y + 63, { width: 95, align: 'right' });
 
       // --- 6. Footer Note ---
+      if (order.paymentDetails?.payUrl && order.paymentStatus !== 'Paid') {
+        doc.fillColor('#00f2fe').fontSize(8).font('Helvetica-Bold').text(`Online Payment Link: ${order.paymentDetails.payUrl}`, 40, 745, { align: 'center', width: 515 });
+      }
       doc.fillColor('#94a3b8').fontSize(8).font('Helvetica').text('Thank you for shopping with TechCore! For support & warranty claims, visit https://techcore.com.bd or call 16793.', 40, 760, { align: 'center', width: 515 });
 
       doc.end();

@@ -47,7 +47,7 @@ import { CouponUsageModel } from './models/CouponUsage.js';
 import { PointTransactionModel } from './models/PointTransaction.js';
 import { DeliveryRuleModel } from './models/DeliveryRule.js';
 import { bdDivisions, bdDistrictsMap, bdUpazilasMap } from './services/bdGeography.js';
-import { initSSLCommerzPayment, validateSSLCommerzTransaction } from './services/sslcommerzService.js';
+import { initSSLCommerzPayment, validateSSLCommerzTransaction, createSSLCommerzInvoice } from './services/sslcommerzService.js';
 import { emiBanksList, calculateEmiInstallment } from './services/emiService.js';
 import { StaticPageModel } from './models/StaticPage.js';
 import { OutletModel } from './models/Outlet.js';
@@ -69,8 +69,12 @@ const PORT = process.env.PORT || 5000;
 
 const defaultClientUrls = [
   'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
   'http://localhost:5173',
   'http://localhost:5174',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
   'https://techcore-client.vercel.app'
 ];
 
@@ -80,17 +84,38 @@ const envClientUrls = process.env.CLIENT_URL
 
 const clientUrls = Array.from(new Set([...defaultClientUrls, ...envClientUrls]));
 
+const isAllowedOrigin = (origin) => {
+  if (!origin) return true;
+  if (clientUrls.includes(origin)) return true;
+  if (typeof origin === 'string') {
+    if (origin.endsWith('.vercel.app')) return true;
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
+  }
+  return false;
+};
+
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || clientUrls.includes(origin) || (typeof origin === 'string' && origin.endsWith('.vercel.app'))) {
+    if (isAllowedOrigin(origin)) {
       return callback(null, true);
     }
-    return callback(new Error(`Not allowed by CORS: ${origin}`));
+    // Return false instead of throwing unhandled 500 Error
+    return callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-cron-secret']
 };
+
+export function getClientRedirectUrl() {
+  const envUrl = (process.env.CLIENT_URL || '').split(',')[0].trim();
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    if (!envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1')) {
+      return 'https://techcore-client.vercel.app';
+    }
+  }
+  return envUrl || 'http://localhost:3000';
+}
 
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
@@ -2472,7 +2497,7 @@ app.all('/api/payment/sslcommerz/success', async (req, res) => {
   try {
     const { orderId, val_id, tran_id, amount, currency } = { ...req.query, ...req.body };
     const targetId = orderId || tran_id;
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
 
     if (!targetId) {
       return res.redirect(`${clientUrl}/checkout/fail?reason=missing_order_id`);
@@ -2545,7 +2570,7 @@ app.all('/api/payment/sslcommerz/success', async (req, res) => {
     return res.redirect(`${clientUrl}/checkout/success?orderId=${order.id}`);
   } catch (err) {
     console.error('SSLCommerz success handler error:', err.message);
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
     return res.redirect(`${clientUrl}/checkout/fail?reason=server_error`);
   }
 });
@@ -2554,7 +2579,7 @@ app.all('/api/payment/sslcommerz/fail', async (req, res) => {
   try {
     const { orderId, tran_id } = { ...req.query, ...req.body };
     const targetId = orderId || tran_id;
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
 
     if (targetId) {
       if (isMongoActive()) {
@@ -2609,7 +2634,7 @@ app.all('/api/payment/sslcommerz/fail', async (req, res) => {
     res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId || ''}`);
   } catch (err) {
     console.error('SSLCommerz fail handler error:', err.message);
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
     res.redirect(`${clientUrl}/checkout/fail`);
   }
 });
@@ -2618,7 +2643,7 @@ app.all('/api/payment/sslcommerz/cancel', async (req, res) => {
   try {
     const { orderId, tran_id } = { ...req.query, ...req.body };
     const targetId = orderId || tran_id;
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
 
     if (targetId) {
       if (isMongoActive()) {
@@ -2673,7 +2698,7 @@ app.all('/api/payment/sslcommerz/cancel', async (req, res) => {
     res.redirect(`${clientUrl}/checkout/fail?orderId=${targetId || ''}&reason=cancelled`);
   } catch (err) {
     console.error('SSLCommerz cancel handler error:', err.message);
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+    const clientUrl = getClientRedirectUrl();
     res.redirect(`${clientUrl}/checkout/fail?reason=cancelled`);
   }
 });
@@ -2799,6 +2824,173 @@ app.all('/api/payment/sslcommerz/ipn', async (req, res) => {
     return res.status(200).send('IPN error caught but acknowledged');
   }
 });
+
+// -------------------------------------------------------------
+// SSLCOMMERZ INVOICE PAYMENT APIS (v4 Invoice API)
+// -------------------------------------------------------------
+
+// Create SSLCommerz Invoice (Payment Link, Bangla QR, Invoice ID)
+app.post('/api/payment/sslcommerz/invoice', async (req, res) => {
+  try {
+    const { orderId, isBanglaQr = true, sendEmail = false, sendSms = false, refer } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'orderId is required' });
+    }
+
+    let order = null;
+    if (isMongoActive()) {
+      order = await OrderModel.findOne({ id: orderId });
+    } else {
+      order = ordersStore.find(o => o.id === orderId);
+    }
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    const protocol = req.protocol || 'http';
+    const host = req.get('host') || 'localhost:5000';
+    const serverBaseUrl = `${protocol}://${host}`;
+
+    const invoiceRes = await createSSLCommerzInvoice({
+      order,
+      serverBaseUrl,
+      isBanglaQr: Boolean(isBanglaQr),
+      sendEmail: Boolean(sendEmail),
+      sendSms: Boolean(sendSms),
+      refer
+    });
+
+    if (invoiceRes && invoiceRes.status === 'SUCCESS') {
+      const invoiceData = {
+        invoiceId: invoiceRes.invoiceId,
+        invoiceRefer: invoiceRes.invoiceRefer,
+        payUrl: invoiceRes.payUrl,
+        qrImageUrl: invoiceRes.qrImageUrl,
+        qrImagePayUrl: invoiceRes.qrImagePayUrl,
+        banglaQrCode: invoiceRes.banglaQrCode
+      };
+
+      if (isMongoActive()) {
+        order.paymentDetails = {
+          ...(order.paymentDetails || {}),
+          ...invoiceData
+        };
+        await order.save();
+      } else {
+        order.paymentDetails = {
+          ...(order.paymentDetails || {}),
+          ...invoiceData
+        };
+      }
+
+      return res.status(200).json({
+        success: true,
+        orderId: order.id,
+        invoice: invoiceRes
+      });
+    }
+
+    return res.status(502).json({
+      success: false,
+      message: invoiceRes?.message || 'Failed to create SSLCommerz invoice',
+      error: invoiceRes?.raw
+    });
+  } catch (err) {
+    console.error('[SSLCommerz Invoice API] Error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while generating SSLCommerz invoice',
+      error: err.message
+    });
+  }
+});
+
+// Retrieve or generate SSLCommerz Invoice for an order
+app.get('/api/payment/sslcommerz/invoice/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    let order = null;
+    if (isMongoActive()) {
+      order = await OrderModel.findOne({ id: orderId });
+    } else {
+      order = ordersStore.find(o => o.id === orderId);
+    }
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    // If order already has generated invoice details, return them
+    if (order.paymentDetails?.payUrl || order.paymentDetails?.invoiceId) {
+      return res.status(200).json({
+        success: true,
+        orderId: order.id,
+        invoice: {
+          invoiceId: order.paymentDetails.invoiceId,
+          payUrl: order.paymentDetails.payUrl,
+          qrImageUrl: order.paymentDetails.qrImageUrl,
+          qrImagePayUrl: order.paymentDetails.qrImagePayUrl,
+          banglaQrCode: order.paymentDetails.banglaQrCode
+        }
+      });
+    }
+
+    // Otherwise generate fresh invoice for unpaid order
+    const protocol = req.protocol || 'http';
+    const host = req.get('host') || 'localhost:5000';
+    const serverBaseUrl = `${protocol}://${host}`;
+
+    const invoiceRes = await createSSLCommerzInvoice({
+      order,
+      serverBaseUrl,
+      isBanglaQr: true
+    });
+
+    if (invoiceRes && invoiceRes.status === 'SUCCESS') {
+      const invoiceData = {
+        invoiceId: invoiceRes.invoiceId,
+        invoiceRefer: invoiceRes.invoiceRefer,
+        payUrl: invoiceRes.payUrl,
+        qrImageUrl: invoiceRes.qrImageUrl,
+        qrImagePayUrl: invoiceRes.qrImagePayUrl,
+        banglaQrCode: invoiceRes.banglaQrCode
+      };
+
+      if (isMongoActive()) {
+        order.paymentDetails = {
+          ...(order.paymentDetails || {}),
+          ...invoiceData
+        };
+        await order.save();
+      } else {
+        order.paymentDetails = {
+          ...(order.paymentDetails || {}),
+          ...invoiceData
+        };
+      }
+
+      return res.status(200).json({
+        success: true,
+        orderId: order.id,
+        invoice: invoiceRes
+      });
+    }
+
+    return res.status(502).json({
+      success: false,
+      message: invoiceRes?.message || 'Failed to create SSLCommerz invoice'
+    });
+  } catch (err) {
+    console.error('[SSLCommerz Get Invoice Error]:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Server error while fetching SSLCommerz invoice',
+      error: err.message
+    });
+  }
+});
+
 
 // EMI Calculator APIs
 app.get('/api/emi/banks', (req, res) => {
