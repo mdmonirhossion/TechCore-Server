@@ -78,40 +78,45 @@ router.get('/tree', async (req, res) => {
 
     // Recursively build tree with fullPath, order sorting, and 4-level cap
     function processNode(node, parentPath = '', level = 1) {
-      node.fullPath = parentPath ? `${parentPath}/${node.slug}` : node.slug;
+      const fullPath = parentPath ? `${parentPath}/${node.slug}` : node.slug;
 
-      if (level >= 4) {
-        node.children = [];
-      } else {
-        node.children.sort((a, b) => (a.order - b.order) || a.name.localeCompare(b.name));
-        for (const child of node.children) {
-          processNode(child, node.fullPath, level + 1);
-        }
+      let processedChildren = [];
+      if (level < 4 && Array.isArray(node.children) && node.children.length > 0) {
+        node.children.sort((a, b) => ((a.order ?? 0) - (b.order ?? 0)) || a.name.localeCompare(b.name));
+        processedChildren = node.children.map(child => processNode(child, fullPath, level + 1));
       }
 
       // Keep only requested fields: id, name, slug, fullPath, icon, image, children
-      const result = {
+      return {
         id: node.id,
         name: node.name,
         slug: node.slug,
-        fullPath: node.fullPath,
-        icon: node.icon,
-        image: node.image,
-        children: node.children
+        fullPath,
+        icon: node.icon || '',
+        image: node.image || '',
+        children: processedChildren
       };
-      return result;
     }
 
-    roots.sort((a, b) => (a.order - b.order) || a.name.localeCompare(b.name));
+    roots.sort((a, b) => ((a.order ?? 0) - (b.order ?? 0)) || a.name.localeCompare(b.name));
     const tree = roots.map(root => processNode(root, '', 1));
 
     res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=600');
     return res.json(tree);
   } catch (err) {
-    if (!isMongoConnected() || err.name === 'MongoServerSelectionError' || err.name === 'MongoNetworkError') {
+    if (
+      !isMongoConnected() ||
+      err.name === 'MongoServerSelectionError' ||
+      err.name === 'MongoNetworkError' ||
+      err.name === 'MongoTimeoutError' ||
+      err.name === 'MongooseError' ||
+      err.message?.includes('buffering timed out') ||
+      err.message?.includes('topology was destroyed') ||
+      err.message?.includes('connection')
+    ) {
       return res.status(503).json({
         success: false,
-        message: 'Database service unavailable',
+        message: 'Database service unavailable. MongoDB is not connected.',
         error: err.message
       });
     }
@@ -369,10 +374,19 @@ async function handleCategoryFilters(req, res, rawPath) {
       specs
     });
   } catch (err) {
-    if (!isMongoConnected() || err.name === 'MongoServerSelectionError' || err.name === 'MongoNetworkError') {
+    if (
+      !isMongoConnected() ||
+      err.name === 'MongoServerSelectionError' ||
+      err.name === 'MongoNetworkError' ||
+      err.name === 'MongoTimeoutError' ||
+      err.name === 'MongooseError' ||
+      err.message?.includes('buffering timed out') ||
+      err.message?.includes('topology was destroyed') ||
+      err.message?.includes('connection')
+    ) {
       return res.status(503).json({
         success: false,
-        message: 'Database service unavailable',
+        message: 'Database service unavailable. MongoDB is not connected.',
         error: err.message
       });
     }
@@ -517,10 +531,19 @@ router.get(['/by-path', '/by-path/*'], async (req, res) => {
       descendantIds
     });
   } catch (err) {
-    if (!isMongoConnected() || err.name === 'MongoServerSelectionError' || err.name === 'MongoNetworkError') {
+    if (
+      !isMongoConnected() ||
+      err.name === 'MongoServerSelectionError' ||
+      err.name === 'MongoNetworkError' ||
+      err.name === 'MongoTimeoutError' ||
+      err.name === 'MongooseError' ||
+      err.message?.includes('buffering timed out') ||
+      err.message?.includes('topology was destroyed') ||
+      err.message?.includes('connection')
+    ) {
       return res.status(503).json({
         success: false,
-        message: 'Database service unavailable',
+        message: 'Database service unavailable. MongoDB is not connected.',
         error: err.message
       });
     }
