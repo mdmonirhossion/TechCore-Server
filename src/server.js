@@ -3012,6 +3012,22 @@ app.post('/api/emi/calculate', (req, res) => {
   }
 });
 
+// Admin Orders List API
+app.get('/api/admin/orders', requireApprovedAdmin, async (req, res) => {
+  try {
+    let orders = [];
+    if (isMongoActive()) {
+      orders = await OrderModel.find().sort({ createdAt: -1 }).lean();
+    } else {
+      orders = [...ordersStore].reverse();
+    }
+    res.json({ success: true, orders });
+  } catch (err) {
+    console.error('Fetch Admin Orders Error:', err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // Admin Order Status Transition & Stock / Points Hook
 app.patch('/api/admin/orders/:id/status', requireApprovedAdmin, async (req, res) => {
   try {
