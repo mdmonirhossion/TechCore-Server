@@ -12,10 +12,21 @@ if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
 }
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import crypto from 'crypto';
+
+import docsRouter from './routes/docs.js';
+import { validateBody } from './middleware/validate.js';
+import { registerSchema, loginSchema } from './validations/authValidation.js';
+import {
+  cacheMiddleware,
+  invalidateProductCache,
+  invalidateCategoryCache,
+  getCacheStatus
+} from './services/cacheService.js';
 
 import { connectDB, getLastMongoError } from './config/db.js';
 import cloudinary from './config/cloudinary.js';
@@ -117,9 +128,19 @@ export function getClientRedirectUrl() {
   return envUrl || 'http://localhost:3000';
 }
 
+// Security Headers with Helmet (Protection against Clickjacking, MIME-sniffing, XSS, Info disclosure)
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginOpenerPolicy: false,
+  contentSecurityPolicy: false
+}));
+
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Swagger / OpenAPI Interactive Documentation
+app.use('/api', docsRouter);
 
 // Rate Limiter Memory Store & Middleware
 const rateLimitMap = new Map();
@@ -192,6 +213,12 @@ app.get('/', (req, res) => {
     success: true,
     name: 'TechCore Server API',
     status: 'Online ⚡',
+    security: {
+      headers: 'Helmet Security Headers Enabled 🛡️',
+      validation: 'Zod Request Validation Active 🔒'
+    },
+    cache: getCacheStatus(),
+    documentation: '/api/docs',
     database: {
       connected: active,
       readyState: mongoose.connection.readyState,
@@ -400,7 +427,7 @@ app.post('/api/upload', verifyToken, async (req, res) => {
 // -------------------------------------------------------------
 
 // Register User or Request Co-Admin status
-app.post('/api/auth/register', authRateLimiter, async (req, res) => {
+app.post('/api/auth/register', authRateLimiter, validateBody(registerSchema), async (req, res) => {
   try {
     const { name, email, password, role, phone } = req.body;
     if (!name || !email || !password) {
@@ -454,7 +481,7 @@ app.post('/api/auth/register', authRateLimiter, async (req, res) => {
 });
 
 // Login API
-app.post('/api/auth/login', authRateLimiter, async (req, res) => {
+app.post('/api/auth/login', authRateLimiter, validateBody(loginSchema), async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -693,7 +720,7 @@ export async function checkAndExpireOrder(order) {
 // CATEGORIES, BRANDS, OFFERS & PC BUILDER APIS
 // -------------------------------------------------------------
 app.use('/api/categories', (await import('./routes/categories.js')).default);
-app.get('/api/categories', async (req, res) => {
+app.get('/api/categories', cacheMiddleware('categories', 600), async (req, res) => {
   try {
     let list = [];
     if (isMongoActive()) {
@@ -710,7 +737,7 @@ app.get('/api/categories', async (req, res) => {
   }
 });
 
-app.get('/api/brands', async (req, res) => {
+app.get('/api/brands', cacheMiddleware('categories', 600), async (req, res) => {
   try {
     let list = [];
     if (isMongoActive()) {
@@ -939,7 +966,7 @@ app.get('/api/orders/:id', async (req, res) => {
 
 // PRODUCTS CATALOG & SEARCH APIS
 // -------------------------------------------------------------
-app.get('/api/products', async (req, res) => {
+app.get('/api/products', cacheMiddleware('products', 180), async (req, res) => {
   try {
     const {
       mongoQuery,
@@ -985,7 +1012,7 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
-app.get('/api/products/slug/:slug', async (req, res) => {
+app.get('/api/products/slug/:slug', cacheMiddleware('products', 300), async (req, res) => {
   try {
     const slug = req.params.slug.toLowerCase().trim();
     let product = null;
@@ -1008,7 +1035,7 @@ app.get('/api/products/slug/:slug', async (req, res) => {
   }
 });
 
-app.get('/api/products/:id', async (req, res) => {
+app.get('/api/products/:id', cacheMiddleware('products', 300), async (req, res) => {
   try {
     const { id } = req.params;
     let product = null;
@@ -1151,6 +1178,7 @@ app.post('/api/products', requireApprovedAdmin, async (req, res) => {
 
     // Keep productsStore cache in sync
     productsStore.unshift(normalizeProduct(createdProduct));
+    invalidateProductCache();
 
     return res.status(201).json({
       success: true,
@@ -1257,6 +1285,7 @@ app.put('/api/products/:id', requireApprovedAdmin, async (req, res) => {
     if (storeIdx !== -1) {
       productsStore[storeIdx] = normalized;
     }
+    invalidateProductCache();
 
     return res.json({ success: true, product: normalized });
   } catch (err) {
@@ -1288,6 +1317,7 @@ app.delete('/api/products/:id', requireApprovedAdmin, async (req, res) => {
     const prevCount = productsStore.length;
     productsStore = productsStore.filter(p => p.id !== id && p.slug !== id.toLowerCase() && p._id !== id);
     if (productsStore.length < prevCount) deleted = true;
+    invalidateProductCache();
 
     return res.json({ success: true, message: 'Product deleted successfully' });
   } catch (err) {

@@ -4,6 +4,7 @@ import { CategoryModel } from '../models/Category.js';
 import { ProductModel } from '../models/Product.js';
 import { getCategoryFilterConfig } from '../config/filterConfig.js';
 import { runCategoryBrandMigration } from '../scripts/migrateCategoriesAndBrands.js';
+import { cacheMiddleware } from '../services/cacheService.js';
 
 const router = express.Router();
 
@@ -33,7 +34,7 @@ async function ensureCategoryTreeSeeded() {
  * fullPath = slugs joined with '/' from the root (e.g. "laptop/gaming-laptop").
  * Cache-Control: public, s-maxage=300, stale-while-revalidate=600.
  */
-router.get('/tree', async (req, res) => {
+router.get('/tree', cacheMiddleware('categories', 600), async (req, res) => {
   if (!isMongoConnected()) {
     return res.status(503).json({
       success: false,
